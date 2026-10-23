@@ -1,0 +1,260 @@
+// ZCode Builder — Prisma schema (SQLite)
+// Merges the deprecated branch model with new core-native needs.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:../db/custom.db"
+}
+
+model Project {
+  id             String   @id @default(cuid())
+  title          String   @default("Untitled Project")
+  mode           String   @default("web") // builtin slug or custom:<slug>
+  framework      String   @default("react-vite")
+  modeConfig     String   @default("{}") // {designSystem, style, tone, docType, runtime, targetUrl, mcpServers}
+  status         String   @default("active")
+  sandboxId      String?
+  sandboxStatus  String   @default("stopped") // stopped|provisioning|running|error
+  sandboxRuntime String   @default("local") // local|e2b
+  agentMode      String   @default("build") // plan|build|edit|yolo|auto
+  swarmEnabled   Boolean  @default(false)
+  agentsActive   String   @default("[]")
+  instructions   String?
+  initialPrompt  String?
+  githubRepo     String?
+  githubBranch   String?
+  hue            Int      @default(28)
+  coreSessionId  String? // live zcode session id
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  messages    AgentMessage[]
+  events      AgentEvent[]
+  files       ProjectFile[]
+  artifacts   Artifact[]
+  checkpoints Checkpoint[]
+  swarmRuns   SwarmRun[]
+}
+
+model ProjectFile {
+  id        String  @id @default(cuid())
+  projectId String
+  path      String
+  content   String  @default("")
+  encoding  String  @default("utf8") // utf8|base64
+  size      Int     @default(0)
+  updatedAt DateTime @updatedAt
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, path])
+}
+
+model AgentMessage {
+  id        String   @id @default(cuid())
+  projectId String
+  role      String // user|assistant
+  parts     String   @default("[]") // JSON Part[]
+  seq       Int
+  createdAt DateTime @default(now())
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, seq])
+}
+
+model AgentEvent {
+  id        String   @id @default(cuid())
+  projectId String
+  kind      String // status|sandbox|devserver|preview|git|terminal|artifacts|error|filetree|swarm|delegation|checkpoint
+  payload   String   @default("{}")
+  seq       Int
+  createdAt DateTime @default(now())
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, seq])
+}
+
+model Artifact {
+  id        String   @id @default(cuid())
+  projectId String
+  name      String
+  path      String
+  type      String   @default("other") // html|image|code|doc|deck|data|other
+  mime      String   @default("")
+  size      Int      @default(0)
+  createdAt DateTime @default(now())
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}
+
+model Checkpoint {
+  id               String   @id @default(cuid())
+  projectId        String
+  label            String
+  commitHash       String?
+  coreCheckpointId String?
+  createdAt        DateTime @default(now())
+  project          Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}
+
+model Setting {
+  key   String @id
+  value String @default("{}") // JSON
+}
+
+model ProviderConfig {
+  id           String   @id @default(cuid())
+  providerId   String   @unique // openai|anthropic|openrouter|... (builtin: zai-bridge)
+  providerName String
+  apiKey       String   @default("")
+  baseUrl      String   @default("")
+  apiType      String   @default("openai-chat-completions") // openai-chat-completions|anthropic-messages|openai-responses
+  models       String   @default("[]") // [{modelId, contextWindow?, supportsImages?}]
+  enabled      Boolean  @default(true)
+  isBuiltin    Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model SkillInstall {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  name        String
+  description String   @default("")
+  source      String   @default("builtin") // builtin|superpowers|design|custom|url|npx|folder
+  scope       String   @default("workspace") // workspace|user
+  enabled     Boolean  @default(true)
+  meta        String   @default("{}")
+  createdAt   DateTime @default(now())
+}
+
+model McpServer {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  type      String   @default("stdio") // stdio|http|sse
+  command   String   @default("")
+  args      String   @default("[]")
+  env       String   @default("{}")
+  url       String   @default("")
+  headers   String   @default("{}")
+  enabled   Boolean  @default(true)
+  status    String   @default("unknown") // unknown|ok|error
+  tools     String   @default("[]")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model PluginInstall {
+  id        String   @id @default(cuid())
+  slug      String   @unique
+  manifest  String   @default("{}")
+  enabled   Boolean  @default(true)
+  source    String   @default("builtin")
+  createdAt DateTime @default(now())
+}
+
+model ModeTemplate {
+  id            String   @id @default(cuid())
+  slug          String   @unique // custom:<slug>
+  name          String
+  icon          String   @default("Sparkles")
+  color         String   @default("#b4532a")
+  directive     String   @default("")
+  framework     String   @default("react-vite")
+  skills        String   @default("[]")
+  tools         String   @default("[]")
+  mcps          String   @default("[]")
+  startingFiles String   @default("[]") // [{path, content}]
+  samplePrompts String   @default("[]")
+  swarmAllowed  Boolean  @default(true)
+  isBuiltin     Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+model AgentProfile {
+  id            String    @id @default(cuid())
+  slug          String    @unique
+  name          String
+  systemPrompt  String    @default("")
+  toolsAllow    String    @default("[]")
+  toolsDeny     String    @default("[]")
+  skills        String    @default("[]")
+  modelProvider String    @default("")
+  modelId       String    @default("")
+  color         String    @default("clay")
+  maxTurns      Int       @default(24)
+  enabled       Boolean   @default(true)
+  isStarter     Boolean   @default(false)
+  spawnCount    Int       @default(0)
+  lastUsedAt    DateTime?
+  createdAt     DateTime  @default(now())
+}
+
+model SwarmRun {
+  id        String   @id @default(cuid())
+  projectId String
+  goal      String
+  status    String   @default("planning") // planning|running|integrating|done|failed|stopped
+  planMd    String   @default("")
+  dagJson   String   @default("{}")
+  runDir    String   @default("")
+  summary   String   @default("")
+  error     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  tasks     SwarmTask[]
+  workers   SwarmWorker[]
+  events    SwarmEvent[]
+}
+
+model SwarmTask {
+  id          String    @id @default(cuid())
+  runId       String
+  nodeKey     String
+  subject     String
+  description String    @default("")
+  role        String    @default("executor")
+  lane        String    @default("main")
+  filePaths   String    @default("[]")
+  dependsOn   String    @default("[]")
+  acceptance  String    @default("[]")
+  status      String    @default("pending") // pending|blocked|in_progress|completed|failed
+  owner       String?
+  claimToken  String?
+  leasedUntil DateTime?
+  version     Int       @default(0)
+  result      String?
+  error       String?
+  attempts    Int       @default(0)
+  createdAt   DateTime  @default(now())
+  run         SwarmRun  @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@unique([runId, nodeKey])
+}
+
+model SwarmWorker {
+  id            String    @id @default(cuid())
+  runId         String
+  slug          String // worker-1
+  role          String    @default("executor")
+  status        String    @default("idle") // idle|working|blocked|done|failed
+  currentTask   String?
+  workspaceDir  String?
+  sandboxId     String?
+  lastHeartbeat DateTime?
+  createdAt     DateTime  @default(now())
+  run           SwarmRun  @relation(fields: [runId], references: [id], onDelete: Cascade)
+}
+
+model SwarmEvent {
+  id        String   @id @default(cuid())
+  runId     String
+  type      String
+  payload   String   @default("{}")
+  createdAt DateTime @default(now())
+  run       SwarmRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+}

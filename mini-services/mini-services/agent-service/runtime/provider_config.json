@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "config": {
+    "providerOrder": [
+      "zai-bridge"
+    ],
+    "providerConfigRules": {
+      "providerRules": [
+        {
+          "providerId": "zai-bridge",
+          "providerName": "Z.ai built-in (free)",
+          "enabled": true,
+          "config": {
+            "group": "standard-personal",
+            "access": {
+              "type": "api-key",
+              "apiKey": "builtin"
+            },
+            "api": {
+              "type": "openai-chat-completions",
+              "baseUrl": "http://127.0.0.1:3031/llm/v1"
+            },
+            "personalModelIds": [
+              "zai-glm"
+            ],
+            "modelOrder": [
+              "zai-glm"
+            ]
+          }
+        }
+      ]
+    },
+    "modelConfigRules": {
+      "providerModelRules": [
+        {
+          "providerId": "zai-bridge",
+          "modelId": "zai-glm",
+          "config": {
+            "enabled": true,
+            "properties": {
+              "contextWindow": 200000,
+              "inputFormat": {
+                "supportsText": true,
+                "supportsImage": false,
+                "supportsVideo": false,
+                "supportsAudio": false,
+                "supportsPdf": false
+              },
+              "outputFormat": {
+                "supportsText": true
+              },
+              "supportsToolCall": true,
+              "supportsJsonSchemaOutput": false,
+              "supportsNativeWebSearch": false,
+              "supportsMidConversationSystem": true,
+              "requiresMfjsToolSchema": false
+            },
+            "optionSpecs": {
+              "maxOutputTokens": {
+                "max": 32000
+              },
+              "reasoningLevel": {
+                "values": [
+                  "disabled",
+                  "enabled"
+                ],
+                "map": "{}"
+              }
+            }
+          }
+        }
+      ],
+      "manualProviderModelRules": []
+    },
+    "defaultModelSelection": {
+      "providerId": "zai-bridge",
+      "modelId": "zai-glm",
+      "options": {
+        "reasoningLevel": "enabled"
+      }
+    }
+  }
+}

@@ -1,0 +1,8 @@
+# ZCode Builder — Web Dev E2B template manifest
+name = "zcode-web"
+dockerfile = "Dockerfile"
+start_cmd = "sleep infinity"
+
+[env]
+ZCODE_MODE = "web"
+ZCODE_PORTS = "5173,3000,5000,8080"

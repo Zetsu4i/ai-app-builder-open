@@ -1,0 +1,7 @@
+# ZCode Builder — Presentation Mode E2B template manifest
+name = "zcode-presentation"
+dockerfile = "Dockerfile"
+start_cmd = "sleep infinity"
+
+[env]
+ZCODE_MODE = "presentation"

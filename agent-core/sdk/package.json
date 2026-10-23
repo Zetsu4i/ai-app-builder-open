@@ -1,0 +1,9 @@
+{
+  "name": "zcode-protocol-sdk",
+  "version": "0.1.0",
+  "description": "Unofficial SDK for the ZCode Protocol NDJSON stdio app-server (zcode app-server --stdio)",
+  "main": "index.js",
+  "license": "MIT",
+  "engines": { "node": ">=18" },
+  "keywords": ["zcode", "agent", "protocol", "sdk", "mcp", "llm"]
+}

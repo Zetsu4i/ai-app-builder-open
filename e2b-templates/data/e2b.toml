@@ -1,0 +1,7 @@
+# ZCode Builder — Data Analysis E2B template manifest
+name = "zcode-data"
+dockerfile = "Dockerfile"
+start_cmd = "sleep infinity"
+
+[env]
+ZCODE_MODE = "data"

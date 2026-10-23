@@ -1,0 +1,7 @@
+# ZCode Builder — Design Mode E2B template manifest
+name = "zcode-design"
+dockerfile = "Dockerfile"
+start_cmd = "sleep infinity"
+
+[env]
+ZCODE_MODE = "design"

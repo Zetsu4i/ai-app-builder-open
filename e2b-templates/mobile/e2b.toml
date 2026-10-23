@@ -1,0 +1,8 @@
+# ZCode Builder — Mobile Dev E2B template manifest
+name = "zcode-mobile"
+dockerfile = "Dockerfile"
+start_cmd = "sleep infinity"
+
+[env]
+ZCODE_MODE = "mobile"
+ZCODE_PORTS = "8081,19000,19001,19002"

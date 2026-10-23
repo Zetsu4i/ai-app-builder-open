@@ -1,2 +1,14 @@
-skills/
 node_modules/
+.next/
+*.log
+dev.log
+agent-service.log
+workspaces/
+swarm-runs/
+mini-services/agent-service/runtime/zcode-data/
+mini-services/agent-service/runtime/provider_config.json
+db/*.db
+.env
+*.tsbuildinfo
+.DS_Store
+tool-results/

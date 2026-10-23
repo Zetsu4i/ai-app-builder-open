@@ -1,0 +1,8 @@
+# ZCode Builder — Reverse Engineering E2B template manifest
+name = "zcode-reverse"
+dockerfile = "Dockerfile"
+start_cmd = "sleep infinity"
+
+[env]
+ZCODE_MODE = "reverse"
+GHIDRA_HOME = "/opt/ghidra"

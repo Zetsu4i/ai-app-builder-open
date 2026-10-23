@@ -1,0 +1,7 @@
+# ZCode Builder — Anything Mode E2B template manifest
+name = "zcode-anything"
+dockerfile = "Dockerfile"
+start_cmd = "sleep infinity"
+
+[env]
+ZCODE_MODE = "anything"
