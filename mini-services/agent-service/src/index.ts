@@ -44,6 +44,7 @@ import {
   scanArtifacts,
   devServerAction,
   devServerInfo,
+  discoverWorkspacePorts,
   runTerminal,
   exportChatMarkdown,
   exportZipPath,
@@ -53,9 +54,53 @@ import * as mgr from "./managers";
 import { emitProjectEvent, persistUserMessage, nextMessageSeq, activeChatSession, liveStateForProject } from "./turns";
 import { maybeAutoStartDevServer } from "./devserver-autostart";
 import { BUILTIN_MODES } from "./modes";
+import { MODE_RULES, agentsMdFor } from "./agents-md";
 
 ensureDirs();
 ensureSeedPlugins();
+
+/** Environment lines injected into every workspace AGENTS.md on each turn. */
+function envLinesFor(projectId: string, isE2B: boolean): string[] {
+  const lines: string[] = [
+    "- Screenshots / browser verification: use the `forge-browser` MCP tools (forge_screenshot, forge_navigate, forge_get_text, forge_click) with a full URL. The node_repl browser plugin (agent.browsers.*) is NOT available in this environment — never call it.",
+  ];
+  if (isE2B) {
+    const info = sandboxDevServerInfo(projectId);
+    if (info.cloudUrl) lines.push(`- Live preview URL (use with forge-browser tools): ${info.cloudUrl}`);
+  } else {
+    const dev = devServerInfo(projectId);
+    if (dev.status === "ready" && dev.port) {
+      lines.push(`- Live dev server: http://127.0.0.1:${dev.port}/ (served by the platform; already running — do NOT start your own).`);
+      lines.push(`- Live preview URL (use with forge-browser tools): http://127.0.0.1:${dev.port}/preview/${projectId}/`);
+    }
+  }
+  return lines;
+}
+
+/** Make sure the builtin forge-browser MCP server row exists (screenshot tools). */
+async function ensureBuiltinMcps(): Promise<void> {
+  try {
+    const existing = await db.mcpServer.findUnique({ where: { name: "forge-browser" } });
+    const command = process.execPath.includes("bun") ? "bun" : "node";
+    const script = "/home/z/my-project/mini-services/forge-browser-mcp/index.ts";
+    if (!existing) {
+      await db.mcpServer.create({
+        data: {
+          name: "forge-browser",
+          type: "stdio",
+          command,
+          args: JSON.stringify([script]),
+          env: JSON.stringify({}),
+          enabled: true,
+        },
+      });
+      console.log("[mcps] seeded builtin forge-browser MCP server");
+    }
+  } catch (e) {
+    console.warn("[mcps] ensureBuiltinMcps failed:", (e as Error).message);
+  }
+}
+void ensureBuiltinMcps();
 
 // ---------------- socket.io ----------------
 const httpServer = http.createServer((req, res) => {
@@ -148,14 +193,18 @@ async function readBody(req: http.IncomingMessage): Promise<Record<string, unkno
   });
 }
 
-function streamFile(res: http.ServerResponse, filePath: string, mime: string) {
+function streamFile(res: http.ServerResponse, filePath: string, mime: string, injectBridge = false) {
   const stat = fs.statSync(filePath);
   res.writeHead(200, {
     "Content-Type": mime,
-    "Content-Length": stat.size,
     "Access-Control-Allow-Origin": "*",
     "Content-Security-Policy": "frame-ancestors *",
   });
+  if (injectBridge && mime === "text/html") {
+    res.end(injectForgeBridge(fs.readFileSync(filePath)));
+    return;
+  }
+  res.setHeader("Content-Length", stat.size);
   fs.createReadStream(filePath).pipe(res);
 }
 
@@ -427,7 +476,9 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
   if (m && method === "POST") {
     const id = m[1];
     const content = String(body.content || "").trim();
-    if (!content) return json(res, 400, { error: "empty content" });
+    const attachments = Array.isArray(body.attachments) ? (body.attachments as { name?: string; mime?: string; dataBase64?: string }[]).slice(0, 6) : [];
+    const pickedElements = Array.isArray(body.pickedElements) ? (body.pickedElements as Record<string, unknown>[]).slice(0, 12) : [];
+    if (!content && attachments.length === 0) return json(res, 400, { error: "empty content" });
     const row = await db.project.findUnique({ where: { id } });
     if (!row) return json(res, 404, { error: "not found" });
 
@@ -457,12 +508,65 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
         // 2. worklog
         const dir = projectWorkspaceDir(id);
         const taskId = nextWorklogTaskId(dir);
-        appendWorklogRunHeader(dir, taskId, content);
+        appendWorklogRunHeader(dir, taskId, content || "(attachment only)");
+
+        // 2b. attachments → workspace .zcode-attachments/ + user-message parts + agent context block
+        const userParts: Record<string, unknown>[] = [{ type: "text", text: content }];
+        const ctxLines: string[] = [];
+        if (attachments.length > 0) {
+          const attDir = path.join(dir, ".zcode-attachments");
+          fs.mkdirSync(attDir, { recursive: true });
+          const saved: string[] = [];
+          for (const a of attachments) {
+            if (!a?.name || !a?.dataBase64) continue;
+            const safe = a.name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120);
+            let disk = path.join(attDir, safe);
+            let n = 1;
+            while (fs.existsSync(disk)) {
+              const ext = path.extname(safe);
+              disk = path.join(attDir, `${path.basename(safe, ext) || "file"}-${n}${ext}`);
+              n++;
+            }
+            try {
+              fs.writeFileSync(disk, Buffer.from(a.dataBase64, "base64"));
+              const relPath = `.zcode-attachments/${path.basename(disk)}`;
+              saved.push(`${relPath} (${a.mime || "application/octet-stream"}, ${(Buffer.from(a.dataBase64, "base64").length / 1024).toFixed(1)} KB)`);
+              userParts.push({ type: "attachment", name: path.basename(disk), mime: a.mime || "application/octet-stream", size: Buffer.from(a.dataBase64, "base64").length, path: relPath });
+            } catch {
+              /* skip undecodable attachment */
+            }
+          }
+          if (saved.length > 0) {
+            ctxLines.push(`The user attached files to this message (already saved into the workspace):\n${saved.map((s) => `- ${s}`).join("\n")}\nRead them with the Read tool when relevant.`);
+          }
+        }
+        if (pickedElements.length > 0) {
+          const lines = pickedElements.map((el, i) => {
+            const styles = el.styles && typeof el.styles === "object" ? Object.entries(el.styles as Record<string, string>).map(([k, v]) => `${k}:${v}`).join("; ") : "";
+            const note = el.instructions ? ` — user note: ${String(el.instructions)}` : "";
+            return `${i + 1}. <${String(el.tag ?? "el")}> "${String(el.text ?? "").slice(0, 80)}" — selector: \`${String(el.selector ?? "body")}\`${styles ? ` — styles: ${styles}` : ""}${note}`;
+          });
+          ctxLines.push(
+            `The user selected these element(s) in the live preview and wants you to work on exactly them (do not re-create the page — target these elements):\n${lines.join("\n")}`,
+          );
+          for (const el of pickedElements) {
+            userParts.push({ type: "picked-element", pick: el });
+          }
+        }
+
+        // 2c. refresh AGENTS.md with the current environment (dev server, tools)
+        try {
+          const mode = await resolveMode(row.mode);
+          const envLines = envLinesFor(id, isE2B);
+          fs.writeFileSync(path.join(dir, "AGENTS.md"), agentsMdFor(mode.name, MODE_RULES[row.mode] || MODE_RULES.default, envLines));
+        } catch {
+          /* non-fatal */
+        }
 
         // 3. title
         const msgCount = await db.agentMessage.count({ where: { projectId: id } });
         if (msgCount === 0 && row.title === "Untitled Project") {
-          const title = await generateTitle(content);
+          const title = await generateTitle(content || attachments[0]?.name || "New project");
           if (title) {
             await db.project.update({ where: { id }, data: { title } });
             io.to(`project:${id}`).emit("title", { projectId: id, title });
@@ -471,7 +575,7 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
 
         // 4. persist user message + start turn
         await ensureDefaultSession(id);
-        await persistUserMessage(id, content);
+        await persistUserMessage(id, content, userParts);
         const runtime = getRuntime();
         const modelPref = await mgr.getRawSetting("defaultModel");
         const defaultModel = typeof modelPref === "object" && modelPref ? (modelPref as { defaultModel?: string }).defaultModel : undefined;
@@ -482,12 +586,13 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
         const chatSession = await activeChatSession(id);
         if (chatSession) {
           const data: Record<string, unknown> = { coreSessionId, updatedAt: new Date() };
-          if (chatSession.title.startsWith("Task ")) data.title = content.split("\n")[0].slice(0, 60);
+          if (chatSession.title.startsWith("Task ")) data.title = (content || "New task").split("\n")[0].slice(0, 60);
           await db.chatSession.update({ where: { id: chatSession.id }, data }).catch(() => undefined);
         }
         // update policy cache before turn
         await policyFor(id);
-        const ok = await runtime.send(id, content);
+        const agentContent = ctxLines.length > 0 ? `${content}${content ? "\n\n" : ""}${ctxLines.join("\n\n")}` : content;
+        const ok = await runtime.send(id, agentContent);
         if (!ok) throw new Error("no active session for project");
         await mgr.bumpUsage({ modelRequestCount: 1 });
         // the preview should come alive by itself once the first turn starts
@@ -691,6 +796,13 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
       const result = await devServerAction(id, (body.action as "start" | "stop" | "restart") || "start", row?.framework || "react-vite", row?.mode || "web");
       return json(res, 200, result);
     }
+  }
+
+  // ---------- ports (preview port selector) ----------
+  m = p.match(/^\/api\/projects\/([^/]+)\/ports$/);
+  if (m && method === "GET") {
+    const ports = isE2BActive(m[1]) ? [] : await discoverWorkspacePorts(m[1]);
+    return json(res, 200, { ports });
   }
 
   // ---------- sandbox ----------
@@ -940,10 +1052,121 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
 // ---------------- preview serving ----------------
 const INDEX_CANDIDATES = ["", "index.html", "design/index.html", "dist/index.html", "build/index.html", "public/index.html", "out/index.html", "slides/index.html"];
 
+/**
+ * The forge element-picker bridge — injected into EVERY html response so the
+ * workspace "Select" flow works via postMessage WITHOUT reloading the iframe
+ * (the old ?forge_pick=1 reload blanked the preview).
+ */
+function forgeBridgeScript(): string {
+  return `<script data-forge-bridge>(function(){
+  if (window.__forgeBridge) return; window.__forgeBridge = true;
+  var enabled = false;
+  function setEnabled(v){ enabled = !!v; document.documentElement.style.setProperty('cursor', enabled ? 'crosshair' : ''); }
+  window.addEventListener('message', function(e){
+    var d = e.data || {};
+    if (d.type === 'forge:enable-pick') setEnabled(true);
+    else if (d.type === 'forge:disable-pick') setEnabled(false);
+  });
+  function cssPath(el){
+    var parts = [];
+    while (el && el.nodeType === 1 && parts.length < 6) {
+      var sel = el.tagName.toLowerCase();
+      if (el.id) { sel += '#' + el.id; parts.unshift(sel); break; }
+      var cls = (el.className && typeof el.className === 'string') ? el.className.trim().split(/\\s+/).slice(0,2).join('.') : '';
+      if (cls) sel += '.' + cls;
+      var sib = el, n = 1;
+      while ((sib = sib.previousElementSibling)) n++;
+      if (n > 1) sel += ':nth-of-type(' + n + ')';
+      parts.unshift(sel);
+      el = el.parentElement;
+    }
+    return parts.join(' > ') || 'body';
+  }
+  function pickStyles(el){
+    try {
+      var c = getComputedStyle(el);
+      var keys = ['display','font-size','font-weight','color','background-color','padding','margin','border-radius','border','text-align'];
+      var out = {};
+      for (var i = 0; i < keys.length; i++) { var v = c.getPropertyValue(keys[i]); if (v) out[keys[i]] = v; }
+      return out;
+    } catch (err) { return {}; }
+  }
+  document.addEventListener('click', function(ev){
+    if (!enabled) return;
+    ev.preventDefault(); ev.stopPropagation();
+    var el = ev.target;
+    if (!el || el.nodeType !== 1) return;
+    var text = (el.innerText || el.textContent || '').trim().slice(0, 200);
+    try {
+      parent.postMessage({ type: 'forge:picked', selector: cssPath(el), tag: el.tagName.toLowerCase(), text: text, styles: pickStyles(el) }, '*');
+    } catch (err) {}
+  }, true);
+})();</script>`;
+}
+
+function injectForgeBridge(buf: Buffer): string {
+  const html = buf.toString("utf8");
+  if (html.includes("data-forge-bridge")) return html;
+  if (/<\/body>/i.test(html)) return html.replace(/<\/body>/i, forgeBridgeScript() + "</body>");
+  if (/<\/html>/i.test(html)) return html.replace(/<\/html>/i, forgeBridgeScript() + "</html>");
+  return html + forgeBridgeScript();
+}
+
+/** Forward to a secondary port the agent opened: /preview/<id>/p/<port>/... */
+async function serveSecondaryPort(projectId: string, port: number, rest: string, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  const target = `http://127.0.0.1:${port}${rest || "/"}${url_suffix(req)}`;
+  try {
+    const headers: Record<string, string> = {};
+    for (const [k, v] of Object.entries(req.headers)) if (typeof v === "string" && !["host", "connection", "origin", "referer"].includes(k)) headers[k] = v;
+    const proxyRes = await fetch(target, {
+      method: req.method,
+      headers,
+      body: req.method === "GET" || req.method === "HEAD" ? undefined : new Uint8Array(await readRaw(req)),
+      redirect: "manual",
+    });
+    const respHeaders: Record<string, string> = { "Access-Control-Allow-Origin": "*", "Content-Security-Policy": "frame-ancestors *" };
+    proxyRes.headers.forEach((v, k) => {
+      if (!["content-encoding", "transfer-encoding", "connection", "content-length", "content-security-policy", "cache-control"].includes(k)) respHeaders[k] = v;
+    });
+    const ct2 = proxyRes.headers.get("content-type") || "";
+    if (ct2.includes("text/html") || /javascript|ecmascript/.test(ct2)) respHeaders["Cache-Control"] = "no-store, no-cache, must-revalidate";
+    res.writeHead(proxyRes.status, respHeaders);
+    const buf = Buffer.from(await proxyRes.arrayBuffer());
+    const ct = respHeaders["content-type"] || "";
+    if (ct.includes("text/html")) {
+      // root-relative URLs resolve under the proxy via <base>; the bridge rides along
+      let html = buf.toString("utf8");
+      if (!html.includes("<base ")) html = html.replace(/<head([^>]*)>/i, `<head$1><base href="/preview/${projectId}/p/${port}/">`);
+      res.end(injectForgeBridge(Buffer.from(html, "utf8")));
+      return;
+    }
+    // rewrite root-relative imports in served JS so module graphs survive the subpath
+    if (/javascript|ecmascript/.test(ct) && proxyRes.status === 200) {
+      const js = buf.toString("utf8").replace(/(from\s*|import\s*\(?\s*)(["'])\/(?!\/)/g, `$1$2/preview/${projectId}/p/${port}/`);
+      res.end(js);
+      return;
+    }
+    res.end(buf);
+  } catch {
+    res.writeHead(200, { "Content-Type": "text/html", "Content-Security-Policy": "frame-ancestors *", "Cache-Control": "no-store, no-cache, must-revalidate" });
+    res.end(`<!doctype html><html><body style="font-family:system-ui;padding:48px;background:#f4f1eb"><h2>Nothing is listening on :${port}</h2><p>The process may have exited. Ask the agent to start it again.</p></body></html>`);
+  }
+}
+
 async function servePreview(projectId: string, rel: string, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const dev = devServerInfo(projectId);
   const row = await db.project.findUnique({ where: { id: projectId } });
   const isE2B = isE2BActive(projectId);
+
+  // secondary port proxy: /preview/<id>/p/<port>/...
+  const pm = rel.match(/^\/p\/(\d+)(\/.*)?$/);
+  if (pm && (req.method === "GET" || req.method === "POST")) {
+    const port = Number(pm[1]);
+    if (port >= 1024 && port <= 65535 && port !== SERVICE_PORT) {
+      await serveSecondaryPort(projectId, port, pm[2] || "/", req, res);
+      return;
+    }
+  }
 
   // e2b → workspace was synced; serve static (live dev server URLs are used directly by the UI)
 
@@ -966,17 +1189,20 @@ async function servePreview(projectId: string, rel: string, req: http.IncomingMe
       const proxyRes = await proxyReq;
       const respHeaders: Record<string, string> = { "Access-Control-Allow-Origin": "*", "Content-Security-Policy": "frame-ancestors *" };
       proxyRes.headers.forEach((v, k) => {
-        if (!["content-encoding", "transfer-encoding", "connection", "content-length"].includes(k)) respHeaders[k] = v;
+        if (!["content-encoding", "transfer-encoding", "connection", "content-length", "cache-control"].includes(k)) respHeaders[k] = v;
       });
+      const respCt = proxyRes.headers.get("content-type") || "";
+      if (respCt.includes("text/html") || /javascript|ecmascript/.test(respCt)) respHeaders["Cache-Control"] = "no-store, no-cache, must-revalidate";
       res.writeHead(proxyRes.status, respHeaders);
-      const buf = Buffer.from(await proxyRes.arrayBuffer());
-      // flask-ish servers: inject <base> when html and no base handled
+      let buf = Buffer.from(await proxyRes.arrayBuffer());
       const ct = respHeaders["content-type"] || "";
-      if (ct.includes("text/html") && row?.framework === "flask" && rel !== "/") {
-        let html = buf.toString("utf8");
-        if (!html.includes("<base ")) html = html.replace(/<head([^>]*)>/i, `<head$1><base href="/preview/${projectId}/">`);
-        res.end(html);
-        return;
+      if (ct.includes("text/html")) {
+        // flask-ish servers: inject <base> when html and no base handled
+        if (row?.framework === "flask" && rel !== "/" && !buf.toString("utf8").includes("<base ")) {
+          buf = Buffer.from(buf.toString("utf8").replace(/<head([^>]*)>/i, `<head$1><base href="/preview/${projectId}/">`), "utf8");
+        }
+        // element-picker bridge on every html response (no iframe reload needed)
+        buf = Buffer.from(injectForgeBridge(buf), "utf8");
       }
       res.end(buf);
       return;
@@ -994,26 +1220,26 @@ async function servePreview(projectId: string, rel: string, req: http.IncomingMe
       if (!cand) continue;
       const full = path.join(dir, cand);
       if (fs.existsSync(full) && fs.statSync(full).isFile()) {
-        streamFile(res, full, "text/html");
+        streamFile(res, full, "text/html", true);
         return;
       }
     }
   }
   const full = path.join(dir, relClean);
   if (fs.existsSync(full) && fs.statSync(full).isFile()) {
-    streamFile(res, full, mimeFor(relClean));
+    streamFile(res, full, mimeFor(relClean), true);
     return;
   }
   // SPA fallback to any index.html
   for (const cand of INDEX_CANDIDATES) {
     const fp = path.join(dir, cand);
     if (fs.existsSync(fp) && fs.statSync(fp).isFile()) {
-      streamFile(res, fp, "text/html");
+      streamFile(res, fp, "text/html", true);
       return;
     }
   }
-  res.writeHead(200, { "Content-Type": "text/html", "Content-Security-Policy": "frame-ancestors *" });
-  res.end(`<!doctype html><html><head><meta charset="utf-8"><title>Preview</title></head><body style="font-family:system-ui;padding:48px;background:#f4f1eb;color:#1c1917"><h2>No preview yet</h2><p>Ask the agent to build something, or start the dev server.</p></body></html>`);
+  res.writeHead(200, { "Content-Type": "text/html", "Content-Security-Policy": "frame-ancestors *", "Cache-Control": "no-store, no-cache, must-revalidate" });
+  res.end(injectForgeBridge(Buffer.from(`<!doctype html><html><head><meta charset="utf-8"><title>Preview</title></head><body style="font-family:system-ui;padding:48px;background:#f4f1eb;color:#1c1917"><h2>No preview yet</h2><p>Ask the agent to build something, or start the dev server.</p></body></html>`, "utf8")));
 }
 
 function url_suffix(req: http.IncomingMessage): string {

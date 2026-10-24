@@ -5,6 +5,7 @@ import type {
   ArtifactDTO,
   CheckpointDTO,
   DesignSystemDTO,
+  DevServerPort,
   DevServerState,
   FileNode,
   GitLogEntry,
@@ -82,8 +83,16 @@ export const deleteProject = (id: string) => bff<void>(`/projects/${id}`, { meth
 // ---------- chat ----------
 export const hydrateProject = (id: string, sessionId?: string) =>
   bff<HydratePayload>(`/projects/${id}/hydrate${qs({ sessionId })}`);
-export const sendChat = (id: string, body: { content: string; modelSelection?: string; agentMode?: string }) =>
-  bff<{ accepted: boolean }>(`/projects/${id}/chat`, { method: "POST", body: JSON.stringify(body) });
+export const sendChat = (
+  id: string,
+  body: {
+    content: string;
+    modelSelection?: string;
+    agentMode?: string;
+    attachments?: { name: string; mime: string; dataBase64: string }[];
+    pickedElements?: { selector: string; tag: string; text?: string; styles?: Record<string, string>; instructions?: string }[];
+  },
+) => bff<{ accepted: boolean }>(`/projects/${id}/chat`, { method: "POST", body: JSON.stringify(body) });
 export const stopChat = (id: string) => bff<{ stopped: boolean }>(`/projects/${id}/stop`, { method: "POST" });
 export const enhancePrompt = (prompt: string, mode: string): Promise<{ text: string }> =>
   bff("/enhance", { method: "POST", body: JSON.stringify({ prompt, mode }) });
@@ -148,8 +157,11 @@ export const artifactRawUrl = (id: string, path: string) => `/api/bff/projects/$
 export const devServerAction = (id: string, action: "start" | "stop" | "restart") =>
   bff<DevServerState>(`/projects/${id}/devserver`, { method: "POST", body: JSON.stringify({ action }) });
 export const getDevServer = (id: string) => bff<DevServerState>(`/projects/${id}/devserver`);
+export const getPorts = (id: string) => bff<{ ports: DevServerPort[] }>(`/projects/${id}/ports`);
 export const previewUrl = (id: string, path = "") => `/preview/${id}${path}`;
 export const previewBase = (id: string) => `/preview/${id}/`;
+/** Raw proxy for a secondary port the agent opened — /preview/<id>/p/<port>/ */
+export const previewPortBase = (id: string, port: number) => `/preview/${id}/p/${port}/`;
 
 // ---------- sandbox ----------
 export const sandboxAction = (id: string, action: "start" | "stop" | "sync") =>

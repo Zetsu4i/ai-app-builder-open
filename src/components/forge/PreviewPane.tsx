@@ -3,21 +3,23 @@
 // Forge workspace — live preview pane. Ported from the source PreviewPane with
 // real wiring: the iframe loads the project through the same-origin BFF preview
 // proxy (`/api/bff/projects/:id/preview/`) or the e2b cloudUrl for cloud sandboxes.
-// Element picking is message-based: we post {type:"forge:enable-pick"} into the
-// iframe (the preview proxy injects the bridge when ?forge_pick=1) and listen for
-// {type:"forge:picked", selector, tag, text, styles} messages back.
+// Element picking is message-based: the preview proxy injects the picker bridge
+// into every HTML response, so we just post {type:"forge:enable-pick"} into the
+// iframe and listen for {type:"forge:picked", selector, tag, text, styles} back —
+// no reload needed. The address bar also has a port selector for secondary
+// ports the agent opened (`/preview/<id>/p/<port>/` raw proxy).
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Monitor, Tablet, Smartphone, RotateCw, ExternalLink, Lock, Copy, Check,
   ArrowLeft, ArrowRight, Loader2, QrCode, Radio, Wifi, MousePointer2,
-  TriangleAlert, PanelRightClose, ChevronRight,
+  TriangleAlert, PanelRightClose, ChevronRight, ChevronDown,
 } from "lucide-react";
 import { useForge } from "@/lib/store";
-import { previewBase } from "@/lib/api";
-import type { PickedElement } from "@/lib/types";
+import { getPorts, previewBase, previewPortBase } from "@/lib/api";
+import type { DevServerPort, PickedElement } from "@/lib/types";
 import { cn } from "./forge-utils";
-import { PickedElementSheet, PickedChips, FORGE_PICK_FLAG, type ForgePickInbound } from "./ElementPicker";
+import { PickedElementSheet, PickedChips, type ForgePickInbound } from "./ElementPicker";
 
 type DeviceMode = "desktop" | "tablet" | "mobile";
 
@@ -69,6 +71,11 @@ export default function PreviewPane() {
   const [picking, setPicking] = useState(false);
   const [pending, setPending] = useState<PickedElement | null>(null);
   const [qrOpen, setQrOpen] = useState(true);
+  // port selector: null = the platform-managed dev server port
+  const [activePort, setActivePort] = useState<number | null>(null);
+  const [ports, setPorts] = useState<DevServerPort[]>([]);
+  const [portsOpen, setPortsOpen] = useState(false);
+  const [portsLoading, setPortsLoading] = useState(false);
 
   const frameRef = useRef<HTMLIFrameElement>(null);
   const pickingRef = useRef(picking);
@@ -78,11 +85,13 @@ export default function PreviewPane() {
   const useCloud = sandbox.runtime === "e2b" && !!devServer.cloudUrl;
   const base = projectId ? previewBase(projectId) : "";
   const src = useCloud && devServer.cloudUrl ? devServer.cloudUrl : base;
-  const srcWithPick = src + (picking && !useCloud ? (src.includes("?") ? "&" : "?") + FORGE_PICK_FLAG : "");
   const frameKey = `${previewKey}-${localKey}`;
   const status = describeStatus(devServer.status);
   const building = devServer.status === "starting" || devServer.status === "installing";
-  const port = devServer.port ?? 3000;
+  const managedPort = devServer.port ?? 3000;
+  const port = activePort ?? managedPort;
+  const secondaryPort = activePort != null && activePort !== managedPort ? activePort : null;
+  const frameSrc = secondaryPort != null && projectId ? previewPortBase(projectId, secondaryPort) : src;
   const isStopped = devServer.status === "stopped";
 
   /** Push the pick-mode handshake into the iframe once it has loaded. */
@@ -92,7 +101,7 @@ export default function PreviewPane() {
     try {
       win.postMessage(pickingRef.current ? { type: "forge:enable-pick" } : { type: "forge:disable-pick" }, "*");
     } catch {
-      /* cross-origin (e2b cloud url) — bridge flag covers it */
+      /* cross-origin (e2b cloud url) or detached frame — nothing to do */
     }
   }, []);
 
@@ -114,7 +123,7 @@ export default function PreviewPane() {
     return () => window.removeEventListener("message", onMessage);
   }, []);
 
-  // entering pick mode: sync ref + reload iframe with the bridge flag, then handshake
+  // entering pick mode: sync ref + tell the injected bridge over postMessage (no reload)
   useEffect(() => {
     pickingRef.current = picking;
     if (picking) handshake();
@@ -145,6 +154,42 @@ export default function PreviewPane() {
 
   const reload = () => setLocalKey((k) => k + 1);
 
+  /* ---------- port selector ---------- */
+
+  const refreshPorts = useCallback(async () => {
+    if (!projectId) return;
+    setPortsLoading(true);
+    try {
+      const res = await getPorts(projectId);
+      setPorts(res.ports ?? []);
+    } catch {
+      setPorts([]); // graceful: dropdown falls back to "Only the managed port"
+    } finally {
+      setPortsLoading(false);
+    }
+  }, [projectId]);
+
+  // fetch on first open + refresh every time the dropdown opens
+  useEffect(() => {
+    if (portsOpen) void refreshPorts();
+  }, [portsOpen, refreshPorts]);
+
+  // keep the list fresh once the dev server is up
+  useEffect(() => {
+    if (devServer.status === "ready") void refreshPorts();
+  }, [devServer.status, refreshPorts]);
+
+  // a new/restarted dev server → snap back to its managed port
+  useEffect(() => {
+    setActivePort(null);
+  }, [managedPort, projectId]);
+
+  const selectPort = (p: DevServerPort) => {
+    setPortsOpen(false);
+    setActivePort(p.managed ? null : p.port);
+    setLocalKey((k) => k + 1); // remount so the frame cleanly loads the new port
+  };
+
   /** If the frame landed on the "warming up" placeholder, remount until real content shows. */
   const warmupRetries = useRef(0);
   const warmupTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -174,7 +219,10 @@ export default function PreviewPane() {
         const rest = loc.pathname.slice(base.length - 1); // keep leading slash
         setPath(rest + loc.search);
       } else if (loc && loc.pathname.startsWith(`/preview/${projectId}`)) {
-        const rest = loc.pathname.slice((`/preview/${projectId}`).length) || "/";
+        let rest = loc.pathname.slice((`/preview/${projectId}`).length) || "/";
+        if (secondaryPort != null && rest.startsWith(`/p/${secondaryPort}`)) {
+          rest = rest.slice(`/p/${secondaryPort}`.length) || "/"; // strip the secondary-port proxy prefix
+        }
         setPath(rest + loc.search);
       }
     } catch {
@@ -183,14 +231,14 @@ export default function PreviewPane() {
   };
 
   const copyLink = async () => {
-    const url = useCloud && devServer.cloudUrl ? devServer.cloudUrl : `${window.location.origin}${src}`;
+    const url = useCloud && devServer.cloudUrl ? devServer.cloudUrl : `${window.location.origin}${frameSrc}`;
     try { await navigator.clipboard.writeText(url); } catch { /* noop */ }
     setCopied(true);
     setTimeout(() => setCopied(false), 1200);
   };
 
   const openExternal = () => {
-    const url = useCloud && devServer.cloudUrl ? devServer.cloudUrl : src;
+    const url = useCloud && devServer.cloudUrl ? devServer.cloudUrl : frameSrc;
     window.open(url, "_blank", "noopener");
   };
 
@@ -224,11 +272,70 @@ export default function PreviewPane() {
         {/* address bar */}
         <div className="flex h-8 min-w-0 flex-1 items-center gap-1.5 rounded-lg border border-line bg-card px-2">
           <Lock size={11} className="shrink-0 text-moss" />
-          <span className="shrink-0 rounded-md border border-line bg-cream px-1.5 py-[3px] font-mono text-[11px] font-semibold text-ink" title={`Dev server port :${port}`}>
-            :{port}
-          </span>
+          {/* active port badge + port selector */}
+          <div className="relative flex shrink-0 items-center gap-0.5">
+            <span
+              className="rounded-md border border-line bg-cream px-1.5 py-[3px] font-mono text-[11px] font-semibold text-ink"
+              title={secondaryPort != null ? `Previewing secondary port :${port}` : `Managed dev server port :${port}`}
+            >
+              :{port}
+            </span>
+            <button
+              onClick={() => setPortsOpen((v) => !v)}
+              title="Switch preview port"
+              className={cn(
+                "flex h-5 items-center gap-1 rounded-md px-1 text-muted transition hover:bg-black/5 hover:text-ink",
+                portsOpen && "bg-black/5 text-ink",
+              )}
+            >
+              {ports.length > 1 && <span className="font-mono text-[9px] font-bold">{ports.length}</span>}
+              <ChevronDown size={12} className={cn("transition-transform", portsOpen && "rotate-180")} />
+            </button>
+
+            {portsOpen && (
+              <>
+                <div className="fixed inset-0 z-20" onClick={() => setPortsOpen(false)} />
+                <div className="absolute left-0 top-full z-30 mt-1.5 w-[320px] overflow-hidden rounded-xl border border-line bg-card shadow-xl">
+                  <p className="border-b border-line-soft px-3 py-1.5 text-[9.5px] font-bold uppercase tracking-wider text-muted">
+                    Preview port
+                  </p>
+                  {ports.length === 0 ? (
+                    <p className="px-3 py-2.5 text-[11px] text-muted">
+                      {portsLoading ? "Checking ports…" : "Only the managed port"}
+                    </p>
+                  ) : (
+                    <div className="max-h-[240px] overflow-y-auto p-1">
+                      {ports.map((p) => {
+                        const on = p.port === port;
+                        return (
+                          <button
+                            key={p.port}
+                            onClick={() => selectPort(p)}
+                            title={p.cmd || `Port ${p.port}`}
+                            className={cn(
+                              "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left transition",
+                              on ? "bg-black/[0.05]" : "hover:bg-black/[0.04]",
+                            )}
+                          >
+                            <span className="w-[46px] shrink-0 font-mono text-[11px] font-semibold text-ink">:{p.port}</span>
+                            <span className="min-w-0 flex-1 truncate font-mono text-[9.5px] text-muted">{p.cmd || "—"}</span>
+                            {p.managed && (
+                              <span className="shrink-0 rounded-full bg-moss/15 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wide text-moss">
+                                managed
+                              </span>
+                            )}
+                            {on && <Check size={11} className="shrink-0 text-moss" />}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
           <span className="shrink-0 font-mono text-[11.5px] text-muted">{useCloud ? "https://" : "http://"}</span>
-          <span className="w-full min-w-0 shrink truncate bg-transparent font-mono text-[11.5px] text-ink" title={src}>{hostLabel}</span>
+          <span className="w-full min-w-0 shrink truncate bg-transparent font-mono text-[11.5px] text-ink" title={frameSrc}>{hostLabel}</span>
           {building ? (
             <span className="flex shrink-0 items-center gap-1 text-[10.5px] font-semibold text-honey"><Loader2 size={11} className="animate-spin" /> Building…</span>
           ) : devServer.status === "error" ? (
@@ -342,7 +449,7 @@ export default function PreviewPane() {
                 key={frameKey}
                 ref={frameRef}
                 title="Live preview"
-                src={srcWithPick}
+                src={frameSrc}
                 onLoad={onFrameLoad}
                 className="h-full min-h-[420px] w-full border-0 bg-white"
               />

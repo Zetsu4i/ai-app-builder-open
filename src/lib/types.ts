@@ -49,6 +49,8 @@ export type ApprovalPart = {
 export type CheckpointPart = { type: "checkpoint"; id: string; label: string; commitHash?: string };
 export type DiffPart = { type: "diff"; path: string; additions: number; deletions: number };
 export type FileChipPart = { type: "file-chip"; path: string; action?: "read" | "write" | "edit" };
+export type AttachmentPart = { type: "attachment"; name: string; mime: string; size: number; path: string };
+export type PickedElementPart = { type: "picked-element"; pick: PickedElement };
 
 export type MessagePart =
   | TextPart
@@ -60,7 +62,9 @@ export type MessagePart =
   | ApprovalPart
   | CheckpointPart
   | DiffPart
-  | FileChipPart;
+  | FileChipPart
+  | AttachmentPart
+  | PickedElementPart;
 
 export interface ChatMessage {
   id: string;
@@ -79,6 +83,7 @@ export type AgentEventKind =
   | "preview"
   | "git"
   | "terminal"
+  | "console"
   | "artifacts"
   | "error"
   | "filetree"
@@ -167,6 +172,22 @@ export interface DevServerState {
   url?: string; // local preview url (proxied) or cloud url for e2b
   cloudUrl?: string;
   error?: string;
+}
+
+/** A port the project has something listening on (for the preview port selector). */
+export interface DevServerPort {
+  port: number;
+  managed: boolean; // true = the platform-managed dev server
+  cmd: string; // process command line (label)
+}
+
+/** A file attached from the composer (sent with the next message). */
+export interface ChatAttachment {
+  id: string;
+  name: string;
+  mime: string;
+  size: number;
+  dataBase64: string;
 }
 
 export interface SandboxState {

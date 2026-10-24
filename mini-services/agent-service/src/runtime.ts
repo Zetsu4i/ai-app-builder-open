@@ -639,6 +639,7 @@ export class ZCodeRuntime {
       this.sessionIdByProject.delete(projectId);
       this.projectIdBySession.delete(sid);
     }
+    this.mcpsByProject.delete(projectId);
   }
 
   // ---- session registry ----
@@ -713,21 +714,37 @@ export class ZCodeRuntime {
 
   async ensureForProject(projectId: string, workspacePath: string, model?: string, mcpServers?: Json[]): Promise<string> {
     const existing = this.getSessionId(projectId);
-    if (existing) return existing;
+    // track which MCP servers the current session was created with — if the
+    // requested set changed (e.g. a new builtin MCP was seeded), recreate the
+    // session so the tools are actually available to the agent
+    const wanted = (mcpServers ?? []).map((m) => String((m as { name?: string }).name ?? "")).filter(Boolean).sort().join(",");
+    const bound = this.mcpsByProject.get(projectId) ?? "";
+    if (existing) {
+      if (wanted && wanted !== bound) {
+        this.resetSession(projectId);
+      } else {
+        return existing;
+      }
+    }
     const proj = await db.project.findUnique({ where: { id: projectId } });
+    // a session that predates the requested MCP set can't gain the tools by
+    // resuming — start a FRESH session (our UI history is DB-backed anyway)
+    const forceFresh = !!wanted && wanted !== bound;
     const sessionId = await this.createSession({
       projectId,
       workspacePath,
       mode: proj?.agentMode && proj.agentMode !== "build" ? proj.agentMode : undefined,
       model,
       mcpServers,
-      resumeSessionId: proj?.coreSessionId || null,
+      resumeSessionId: forceFresh ? null : proj?.coreSessionId || null,
     });
+    this.mcpsByProject.set(projectId, wanted);
     await db.project.update({ where: { id: projectId }, data: { coreSessionId: sessionId } });
     return sessionId;
   }
 
   private modelByProject = new Map<string, string>();
+  private mcpsByProject = new Map<string, string>();
 
   async send(projectId: string, content: string): Promise<boolean> {
     const conn = await this.ensureConn(projectId);

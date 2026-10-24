@@ -10,7 +10,7 @@ import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   ArrowUp, Bot, Bookmark, Check, ChevronDown, ChevronRight, Copy, FilePenLine,
-  History, Lightbulb, ListChecks, Loader2, MessageSquarePlus, Mic, Paperclip,
+  History, Image as ImageIcon, Lightbulb, ListChecks, Loader2, MessageSquarePlus, Mic, Paperclip,
   Plus, RotateCcw, Settings2, Square, ThumbsDown, ThumbsUp, X, Camera,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -18,8 +18,8 @@ import * as api from "@/lib/api";
 import { useForge } from "@/lib/store";
 import { relTime } from "./forge-utils";
 import type {
-  ApprovalPart, ChatMessage, CheckpointDTO, CheckpointPart, DelegationPart,
-  MessagePart, PlanPart, QuestionPart, ReasoningPart, TextPart,
+  ApprovalPart, AttachmentPart, ChatMessage, CheckpointDTO, CheckpointPart, DelegationPart,
+  MessagePart, PickedElementPart, PlanPart, QuestionPart, ReasoningPart, TextPart,
   ToolInvocationPart,
 } from "@/lib/types";
 import { renderMarkdown } from "./render-markdown";
@@ -96,6 +96,15 @@ const isBusyTool = (t: ToolInvocationPart) =>
   t.state === "running" || t.state === "input-streaming" || t.state === "input-available";
 const isFailedTool = (t: ToolInvocationPart) => t.state === "error" || t.isError === true;
 
+/** display workspace-relative paths in file chips (openFile uses the full path) */
+const shortPath = (f: string) => {
+  const m = f.match(/workspaces\/[a-z0-9]+\/(.+)$/i);
+  if (m) return m[1];
+  const m2 = f.match(/workspace\/(.+)$/);
+  if (m2) return m2[1];
+  return f;
+};
+
 /* ------------------------------------------------------------------ */
 /*  chronological block model                                          */
 /* ------------------------------------------------------------------ */
@@ -111,12 +120,19 @@ type AgentBlock =
   | { kind: "checkpoint"; part: CheckpointPart }
   | { kind: "delegation"; part: DelegationPart; idx: number };
 
-/** Walk parts in order, buffering consecutive groupable tool calls into one block. */
+/** Walk parts in order, buffering consecutive groupable tool calls into one block.
+ *  Reasoning does NOT split a group (thinking interleaves with tools) — only real
+ *  text (or a structural card) between steps starts a new group. */
 function buildBlocks(parts: MessagePart[]): AgentBlock[] {
   const blocks: AgentBlock[] = [];
   let group: ToolInvocationPart[] | null = null;
   const flush = () => {
-    if (group && group.length > 0) blocks.push({ kind: "group", tools: group });
+    if (group && group.length > 0) {
+      // a single finished step doesn't deserve its own "Steps · 1 step" card —
+      // render it as a plain tool row; the wrapper is only kept for the live tail
+      if (group.length === 1 && !isBusyTool(group[0])) blocks.push({ kind: "tool", part: group[0] });
+      else blocks.push({ kind: "group", tools: group });
+    }
     group = null;
   };
   for (let i = 0; i < parts.length; i++) {
@@ -131,27 +147,34 @@ function buildBlocks(parts: MessagePart[]): AgentBlock[] {
       }
       continue;
     }
-    flush();
     switch (p.type) {
-      case "text":
-        blocks.push({ kind: "text", idx: i, part: p });
-        break;
       case "reasoning":
+        // skip over thinking — keep the buffered tool group open
         blocks.push({ kind: "reasoning", idx: i, part: p });
         break;
+      case "text":
+        // real prose between steps splits the group
+        flush();
+        blocks.push({ kind: "text", idx: i, part: p });
+        break;
       case "plan":
+        flush();
         blocks.push({ kind: "plan" });
         break;
       case "question":
+        flush();
         blocks.push({ kind: "question", part: p });
         break;
       case "approval":
+        flush();
         blocks.push({ kind: "approval", part: p });
         break;
       case "checkpoint":
+        flush();
         blocks.push({ kind: "checkpoint", part: p });
         break;
       case "delegation":
+        flush();
         blocks.push({ kind: "delegation", part: p, idx: i });
         break;
       default:
@@ -320,11 +343,11 @@ function PlanCard({ todos }: { todos: TodoLike[] }) {
       </button>
       {open && (
         <div className="space-y-1 border-t border-line-soft px-3 py-2">
-          {todos.map((t) => {
+          {todos.map((t, idx) => {
             const done = t.status === "completed" || t.status === "done";
             const active = t.status === "in_progress";
             return (
-              <div key={t.id} className="flex items-center gap-2.5 py-1 text-[12.5px]">
+              <div key={t.id ? `${t.id}:${idx}` : String(idx)} className="flex items-center gap-2.5 py-1 text-[12.5px]">
                 {done ? (
                   <span className="flex h-[16px] w-[16px] shrink-0 items-center justify-center rounded-full bg-moss/15 text-moss">
                     <Check size={10} strokeWidth={3} />
@@ -403,6 +426,39 @@ function StepsGroup({ tools, projectId, onOpenFile, onOpenBrowser, autoExpand, t
 }
 
 /* ------------------------------------------------------------------ */
+/*  files touched — collapsible dropdown at the end of a response       */
+/* ------------------------------------------------------------------ */
+
+function FilesTouchedCard({ files, onOpenFile }: { files: string[]; onOpenFile: (p: string) => void }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="mt-3 overflow-hidden rounded-xl border border-line bg-card">
+      <button onClick={() => setOpen(!open)} className="flex w-full items-center gap-2 px-3 py-2.5 text-left">
+        <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-full bg-moss/15 text-moss">
+          <FilePenLine size={11} />
+        </span>
+        <span className="shrink-0 text-[12.5px] font-semibold text-ink">Files touched</span>
+        <span className="min-w-0 flex-1 text-[11px] font-medium tabular-nums text-muted">{files.length}</span>
+        {open ? <ChevronDown size={13} className="shrink-0 text-muted" /> : <ChevronRight size={13} className="shrink-0 text-muted" />}
+      </button>
+      {open && (
+        <div className="anim-fade-in flex flex-wrap gap-1.5 border-t border-line-soft bg-cream/50 px-2.5 py-2.5">
+          {files.map((f) => (
+            <button
+              key={f}
+              onClick={() => onOpenFile(f)}
+              className="flex items-center gap-1.5 rounded-lg border border-line bg-card px-2 py-1 font-mono text-[11px] text-ink-soft transition hover:border-ink/25 hover:text-ink"
+            >
+              <FilePenLine size={11} className="shrink-0 text-moss" /> {shortPath(f)}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /*  agent message — strict chronological part flow                     */
 /* ------------------------------------------------------------------ */
 
@@ -458,13 +514,6 @@ function AgentMessage({ msg, isLive, isLast }: { msg: ChatMessage; isLive: boole
       if (typeof fp === "string" && fp) filePaths.add(fp);
     }
   }
-  const shortPath = (f: string) => {
-    const m = f.match(/workspaces\/[a-z0-9]+\/(.+)$/i);
-    if (m) return m[1];
-    const m2 = f.match(/workspace\/(.+)$/);
-    if (m2) return m2[1];
-    return f;
-  };
 
   const copyText = async () => {
     try {
@@ -607,20 +656,8 @@ function AgentMessage({ msg, isLive, isLast }: { msg: ChatMessage; isLive: boole
       {/* artifact cards (real files, most recent few on the last message) */}
       {isLast && !msg.streaming && <RecentArtifacts />}
 
-      {/* files touched */}
-      {filePaths.size > 0 && !msg.streaming && (
-        <div className="mt-3 flex flex-wrap gap-1.5">
-          {Array.from(filePaths).map((f) => (
-            <button
-              key={f}
-              onClick={() => void openFile(f)}
-              className="flex items-center gap-1.5 rounded-lg border border-line bg-card px-2 py-1 font-mono text-[11px] text-ink-soft transition hover:border-ink/25 hover:text-ink"
-            >
-              <FilePenLine size={11} className="shrink-0 text-moss" /> {shortPath(f)}
-            </button>
-          ))}
-        </div>
-      )}
+      {/* files touched — collapsed by default once the turn is over */}
+      {!msg.streaming && filePaths.size > 0 && <FilesTouchedCard files={Array.from(filePaths)} onOpenFile={(f) => void openFile(f)} />}
 
       {/* footer */}
       {!msg.streaming && (
@@ -688,13 +725,54 @@ function UserMessage({ msg }: { msg: ChatMessage }) {
     .filter((p): p is TextPart => p.type === "text")
     .map((p) => p.text)
     .join("\n");
+  const pickParts = msg.parts.filter((p): p is PickedElementPart => p.type === "picked-element");
+  const attachParts = msg.parts.filter((p): p is AttachmentPart => p.type === "attachment");
   const timestamp = new Date(msg.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   return (
     <div className="anim-fade-up flex justify-end px-4 py-3.5">
       <div className="max-w-[92%]">
-        <div className="rounded-2xl rounded-br-md bg-ink px-4 py-2.5 text-[13.5px] leading-relaxed whitespace-pre-wrap text-white shadow-sm">
-          {text}
-        </div>
+        {/* picked elements — compact blue chips above the bubble */}
+        {pickParts.length > 0 && (
+          <div className="mb-1.5 flex flex-col items-end gap-1">
+            {pickParts.map((p, i) => (
+              <div
+                key={p.pick?.id ? `${p.pick.id}:${i}` : `pick-${i}`}
+                className="flex max-w-full flex-wrap items-center gap-1.5 rounded-lg border border-[#2f6bff]/25 bg-[#2f6bff]/10 px-2 py-1"
+              >
+                <span className="shrink-0 font-mono text-[9.5px] font-bold text-[#2f6bff]">{"<"}{p.pick?.tag ?? "el"}{">"}</span>
+                <span className="min-w-0 max-w-[220px] truncate font-mono text-[9.5px] text-[#2f6bff]/85">{p.pick?.selector}</span>
+                {p.pick?.instructions ? (
+                  <span className="min-w-0 max-w-[220px] truncate text-[9.5px] italic text-[#2f6bff]/75">“{p.pick.instructions}”</span>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        )}
+        {/* attachments — neutral file chips above the bubble */}
+        {attachParts.length > 0 && (
+          <div className="mb-1.5 flex flex-col items-end gap-1">
+            {attachParts.map((a, i) => (
+              <div
+                key={`${a.name}:${i}`}
+                className="flex max-w-full items-center gap-1.5 rounded-lg border border-line bg-card px-2 py-1"
+                title={`${a.name} · ${a.mime}`}
+              >
+                {a.mime?.startsWith("image/") ? (
+                  <ImageIcon size={10} className="shrink-0 text-moss" />
+                ) : (
+                  <Paperclip size={10} className="shrink-0 text-muted" />
+                )}
+                <span className="min-w-0 max-w-[240px] truncate text-[10.5px] text-ink-soft">{a.name}</span>
+                <span className="shrink-0 text-[9.5px] tabular-nums text-faint">{Math.max(1, Math.round((a.size ?? 0) / 1024))} KB</span>
+              </div>
+            ))}
+          </div>
+        )}
+        {text.length > 0 && (
+          <div className="rounded-2xl rounded-br-md bg-ink px-4 py-2.5 text-[13.5px] leading-relaxed whitespace-pre-wrap text-white shadow-sm">
+            {text}
+          </div>
+        )}
         <p className="mt-1 text-right text-[10.5px] text-faint">{timestamp}</p>
       </div>
     </div>
@@ -743,6 +821,7 @@ export default function ChatPanel() {
   const composer = useForge((s) => s.composer);
   const activeProject = useForge((s) => s.activeProject);
   const picks = useForge((s) => s.picks);
+  const attachments = useForge((s) => s.attachments);
   const checkpoints = useForge((s) => s.checkpoints);
   const versions = useForge((s) => s.versions);
   const sessions = useForge((s) => s.sessions);
@@ -752,6 +831,7 @@ export default function ChatPanel() {
   const send = useForge((s) => s.send);
   const stop = useForge((s) => s.stop);
   const removePick = useForge((s) => s.removePick);
+  const removeAttachment = useForge((s) => s.removeAttachment);
   const setOverlay = useForge((s) => s.setOverlay);
   const contextPanelOpen = useForge((s) => s.contextPanelOpen);
   const newTask = useForge((s) => s.newTask);
@@ -765,6 +845,7 @@ export default function ChatPanel() {
   const areaRef = useRef<HTMLTextAreaElement>(null);
   const plusBtnRef = useRef<HTMLButtonElement>(null);
   const attachRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const activeSession = sessions.find((s) => s.id === activeSessionId) ?? null;
   const sessionTitle = activeSession?.title ?? activeProject?.title ?? "New task";
@@ -815,6 +896,44 @@ export default function ChatPanel() {
     if (!t || isWorking) return;
     void send(t);
     setDraft("");
+  };
+
+  // native file explorer → base64 attachments riding the next message
+  const ATTACH_MAX_BYTES = 8 * 1024 * 1024; // 8 MB total budget
+  const ATTACH_MAX_FILES = 6;
+  const onFilesChosen = (fileList: FileList | null) => {
+    if (!fileList || fileList.length === 0) return;
+    const files = Array.from(fileList);
+    const store = useForge.getState();
+    let total = store.attachments.reduce((s, a) => s + a.size, 0);
+    let skipped = 0;
+    for (const file of files.slice(0, ATTACH_MAX_FILES)) {
+      if (total + file.size > ATTACH_MAX_BYTES) {
+        skipped++;
+        continue;
+      }
+      total += file.size;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = typeof reader.result === "string" ? reader.result : "";
+        const base64 = result.slice(result.indexOf(",") + 1); // strip dataURL prefix
+        store.addAttachment({
+          id: Math.random().toString(36).slice(2),
+          name: file.name,
+          mime: file.type || "application/octet-stream",
+          size: file.size,
+          dataBase64: base64,
+        });
+      };
+      reader.readAsDataURL(file);
+    }
+    if (skipped > 0) {
+      store.toast({ title: "Some files skipped", description: `${skipped} file${skipped === 1 ? "" : "s"} exceeded the 8 MB attachment budget.`, variant: "error" });
+    } else if (files.length > ATTACH_MAX_FILES) {
+      store.toast({ title: "Attachment limit", description: `Only the first ${ATTACH_MAX_FILES} files were attached.` });
+    }
+    // reset so picking the same file again re-fires onChange
+    if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
   const restoreCp = async (cp: CheckpointDTO) => {
@@ -1078,11 +1197,11 @@ export default function ChatPanel() {
             </button>
             {planOpen && (
               <div className="space-y-1 border-t border-line-soft px-3 py-2">
-                {todos.map((item) => {
+                {todos.map((item, idx) => {
                   const done = item.status === "completed" || item.status === "done";
                   const active = item.status === "in_progress";
                   return (
-                    <div key={item.id} className="flex items-center gap-2 text-[10.5px]">
+                    <div key={item.id ? `${item.id}:${idx}` : String(idx)} className="flex items-center gap-2 text-[10.5px]">
                       {done ? (
                         <Check size={11} className="shrink-0 text-moss" />
                       ) : active ? (
@@ -1102,6 +1221,15 @@ export default function ChatPanel() {
 
       {/* composer */}
       <div className="shrink-0 px-3 pb-3">
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          className="hidden"
+          onChange={(e) => onFilesChosen(e.target.files)}
+          aria-hidden
+          tabIndex={-1}
+        />
         <div
           className={cn(
             "overflow-hidden rounded-2xl border bg-card shadow-[0_8px_28px_-12px_rgba(28,25,23,0.25)] transition",
@@ -1125,6 +1253,30 @@ export default function ChatPanel() {
                       <X size={11} />
                     </button>
                   </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {attachments.length > 0 && (
+            <div className="anim-fade-in border-b border-line-soft bg-cream/70 px-2.5 py-2">
+              <div className="mb-1.5 flex items-center gap-1.5 px-0.5">
+                <Paperclip size={11} className="shrink-0 text-muted" />
+                <span className="text-[10px] font-bold uppercase tracking-wider text-muted">Attached files · {attachments.length}</span>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {attachments.map((a, i) => (
+                  <span key={a.id} className="flex max-w-full items-center gap-1.5 rounded-lg border border-line bg-card px-2 py-1.5">
+                    {a.mime.startsWith("image/") ? (
+                      <ImageIcon size={11} className="shrink-0 text-moss" />
+                    ) : (
+                      <Paperclip size={11} className="shrink-0 text-muted" />
+                    )}
+                    <span className="min-w-0 max-w-[180px] truncate text-[10.5px] text-ink-soft">{a.name}</span>
+                    <span className="shrink-0 text-[9.5px] tabular-nums text-faint">{Math.max(1, Math.round(a.size / 1024))} KB</span>
+                    <button onClick={() => removeAttachment(i)} title="Remove attachment" className="shrink-0 text-faint hover:text-clay">
+                      <X size={11} />
+                    </button>
+                  </span>
                 ))}
               </div>
             </div>
@@ -1168,15 +1320,15 @@ export default function ChatPanel() {
                   "flex h-8 w-8 items-center justify-center rounded-lg transition",
                   contextPanelOpen ? "bg-ink text-white" : "text-muted hover:bg-black/5 hover:text-ink",
                 )}
-                title="Attach context — skills, MCPs and files"
+                title="Skills & MCPs"
               >
                 <Plus size={16} />
               </button>
             </div>
             <button
-              onClick={() => setOverlay("contextPanelOpen", true)}
+              onClick={() => fileInputRef.current?.click()}
               className="flex h-8 w-8 items-center justify-center rounded-lg text-muted transition hover:bg-black/5 hover:text-ink"
-              title="Attach files or screenshots"
+              title="Attach files"
             >
               <Paperclip size={15} />
             </button>

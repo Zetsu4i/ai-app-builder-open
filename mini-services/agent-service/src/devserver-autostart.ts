@@ -18,7 +18,10 @@ function autoStartable(framework: string, mode: string): boolean {
  * Boot the dev server for a project if it is stopped and the workspace has
  * something to serve. Safe to call often — cooldown + status guards inside.
  */
-export async function maybeAutoStartDevServer(projectId: string, reason: "turn-end" | "hydrate" | "manual"): Promise<void> {
+export async function maybeAutoStartDevServer(
+  projectId: string,
+  reason: "turn-end" | "hydrate" | "manual" | "health",
+): Promise<void> {
   try {
     const row = await db.project.findUnique({ where: { id: projectId } });
     if (!row) return;
@@ -35,7 +38,8 @@ export async function maybeAutoStartDevServer(projectId: string, reason: "turn-e
       const info = sandboxDevServerInfo(projectId);
       if (info.status === "ready" || info.status === "starting") return;
       const now = Date.now();
-      if (now - (lastAttempt.get(projectId) ?? 0) < COOLDOWN_MS) return;
+      // health-triggered restarts bypass the cooldown (the server just died)
+      if (reason !== "health" && now - (lastAttempt.get(projectId) ?? 0) < COOLDOWN_MS) return;
       lastAttempt.set(projectId, now);
       await emitProjectEvent(projectId, "devserver", { status: "starting", auto: true, reason });
       void sandboxDevServerAction(projectId, "start", row.framework)
@@ -47,7 +51,7 @@ export async function maybeAutoStartDevServer(projectId: string, reason: "turn-e
     const info = devServerInfo(projectId);
     if (info.status === "ready" || info.status === "starting" || info.status === "installing") return;
     const now = Date.now();
-    if (now - (lastAttempt.get(projectId) ?? 0) < COOLDOWN_MS) return;
+    if (reason !== "health" && now - (lastAttempt.get(projectId) ?? 0) < COOLDOWN_MS) return;
     lastAttempt.set(projectId, now);
     console.log(`[devserver] auto-start (${reason}) project=${projectId.slice(0, 8)} framework=${row.framework}`);
     await emitProjectEvent(projectId, "devserver", { status: "installing", auto: true, reason });

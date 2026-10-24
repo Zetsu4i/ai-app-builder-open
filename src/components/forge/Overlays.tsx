@@ -37,12 +37,13 @@ import {
   TerminalSquare,
   Users,
   X,
+  Cpu,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
 import { useForge, type Toast } from "@/lib/store";
 import type { FileNode } from "@/lib/types";
-import { SettingsSheet } from "./ComposerSettings";
+import { AGENT_MODES } from "./ComposerSettings";
 
 /* ---------------- Command palette ---------------- */
 
@@ -622,7 +623,123 @@ function NewFileBody() {
 
 /* ---------------- Task settings sheet ---------------- */
 
-/** Right-side sheet that hosts the composer SettingsSheet (framework, design system, style, agent mode, swarm). */
+/** Compact task-settings body: agent mode + swarm ONLY (applies to the next agent turn). */
+function TaskSettingsSheet() {
+  const composer = useForge((s) => s.composer);
+  const setComposer = useForge((s) => s.setComposer);
+  const swarmDisabled = composer.mode === "design";
+  const swarmOn = composer.swarm && !swarmDisabled;
+
+  return (
+    <div className="space-y-4">
+      {/* agent mode */}
+      <section>
+        <div className="mb-1.5 flex items-center gap-1.5 px-0.5">
+          <Cpu size={11} className="shrink-0 text-muted" />
+          <span className="text-[10px] font-bold uppercase tracking-wider text-muted">Agent mode</span>
+        </div>
+        <div className="space-y-1">
+          {AGENT_MODES.map((m) => {
+            const on = composer.agentMode === m.id;
+            return (
+              <button
+                key={m.id}
+                onClick={() => setComposer({ agentMode: m.id })}
+                className={cn(
+                  "flex w-full items-center gap-2 rounded-lg border px-2.5 py-2 text-left transition",
+                  on ? "border-ink bg-ink/[0.05] text-ink" : "border-line bg-card text-ink-soft hover:border-ink/20",
+                )}
+              >
+                <span className="shrink-0 text-[12.5px] font-semibold">{m.label}</span>
+                {m.id === "yolo" && (
+                  <span
+                    className={cn(
+                      "shrink-0 rounded px-1 py-px text-[9px] font-bold uppercase tracking-wide",
+                      on ? "bg-white/25" : "bg-black/[0.08]",
+                    )}
+                  >
+                    default
+                  </span>
+                )}
+                <span className="min-w-0 flex-1 truncate text-right text-[10.5px] text-muted">{m.note}</span>
+                {on && <Check size={12} className="ml-auto shrink-0 text-moss" />}
+              </button>
+            );
+          })}
+        </div>
+      </section>
+
+      {/* swarm */}
+      <section>
+        <div className="mb-1.5 flex items-center gap-1.5 px-0.5">
+          <Users size={11} className="shrink-0 text-muted" />
+          <span className="text-[10px] font-bold uppercase tracking-wider text-muted">Swarm</span>
+        </div>
+        <button
+          onClick={() => !swarmDisabled && setComposer({ swarm: !composer.swarm })}
+          disabled={swarmDisabled}
+          className={cn(
+            "flex w-full items-center gap-2.5 rounded-xl border px-3 py-2.5 text-left transition",
+            swarmOn ? "border-clay/40 bg-clay/[0.06]" : "border-line bg-card hover:border-ink/20",
+            swarmDisabled && "cursor-not-allowed opacity-60",
+          )}
+        >
+          <span
+            className={cn(
+              "flex h-8 w-8 shrink-0 items-center justify-center rounded-lg",
+              swarmOn ? "bg-clay text-white" : "bg-black/[0.06] text-ink-soft",
+            )}
+          >
+            <Users size={15} />
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="block text-[12.5px] font-semibold text-ink">Parallel agents</span>
+            <span className="block text-[11px] leading-snug text-muted">
+              {swarmDisabled ? "Swarm is not available in design mode" : "Run sub-agents concurrently on this task."}
+            </span>
+          </span>
+          <span className="toggle shrink-0" data-on={swarmOn} />
+        </button>
+        {swarmOn && (
+          <div className="anim-fade-in mt-2 rounded-xl border border-line bg-cream px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <span className="text-[11.5px] font-semibold">Agents in swarm</span>
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={() => setComposer({ swarmAgents: Math.max(2, composer.swarmAgents - 1) })}
+                  disabled={composer.swarmAgents <= 2}
+                  className="flex h-6 w-6 items-center justify-center rounded-md border border-line bg-card text-[12px] font-bold text-ink-soft transition hover:text-ink disabled:opacity-40"
+                >
+                  −
+                </button>
+                <span className="w-6 text-center font-mono text-[12px] font-bold text-ink">{composer.swarmAgents}</span>
+                <button
+                  onClick={() => setComposer({ swarmAgents: Math.min(6, composer.swarmAgents + 1) })}
+                  disabled={composer.swarmAgents >= 6}
+                  className="flex h-6 w-6 items-center justify-center rounded-md border border-line bg-card text-[12px] font-bold text-ink-soft transition hover:text-ink disabled:opacity-40"
+                >
+                  +
+                </button>
+              </div>
+            </div>
+            <input
+              type="range"
+              min={2}
+              max={6}
+              value={composer.swarmAgents}
+              onChange={(e) => setComposer({ swarmAgents: Number(e.target.value) })}
+              className="mt-2 w-full"
+            />
+          </div>
+        )}
+      </section>
+
+      <p className="border-t border-line-soft pt-3 text-center text-[10.5px] text-faint">Applies to the next agent turn</p>
+    </div>
+  );
+}
+
+/** Right-side sheet: agent mode + swarm options for the next agent turn. */
 export function SettingsSheetModal() {
   const open = useForge((s) => s.settingsSheetOpen);
   const setOverlay = useForge((s) => s.setOverlay);
@@ -647,7 +764,7 @@ export function SettingsSheetModal() {
           </button>
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
-          <SettingsSheet />
+          <TaskSettingsSheet />
         </div>
       </div>
     </div>

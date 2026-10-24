@@ -62,15 +62,15 @@ class PreviewBoundary extends Component<{ children: ReactNode }, { hasError: boo
   }
 }
 
-const TABS: { id: WorkspaceMode; label: string; icon: typeof Eye; hint: string; compact?: boolean }[] = [
+const TABS: { id: WorkspaceMode; label: string; icon: typeof Eye; hint: string }[] = [
   { id: "preview", label: "Preview", icon: Eye, hint: "Preview — your running app, updates on every edit" },
   { id: "code", label: "Code", icon: Code2, hint: "Code — file explorer plus editor, every file editable" },
   { id: "git", label: "Git", icon: GitBranch, hint: "Git — commits, branches, diffs and checkpoints" },
   { id: "database", label: "Database", icon: Database, hint: "Database — sqlite files in the workspace with a SQL runner" },
-  { id: "terminal", label: "Terminal", icon: Terminal, hint: "Terminal — run commands yourself in the sandbox", compact: true },
-  { id: "browser", label: "Computer", icon: Globe, hint: "Computer — watch the agent drive a real browser", compact: true },
-  { id: "console", label: "Console", icon: Bug, hint: "Console — runtime errors from the sandbox, fixable by the agent", compact: true },
-  { id: "stream", label: "Stream", icon: MonitorPlay, hint: "Stream — attach to a live X11 display", compact: true },
+  { id: "terminal", label: "Terminal", icon: Terminal, hint: "Terminal — run commands yourself in the sandbox" },
+  { id: "browser", label: "Computer", icon: Globe, hint: "Computer — watch the agent drive a real browser" },
+  { id: "console", label: "Console", icon: Bug, hint: "Console — runtime errors from the sandbox, fixable by the agent" },
+  { id: "stream", label: "Stream", icon: MonitorPlay, hint: "Stream — attach to a live X11 display" },
   { id: "jobs", label: "Jobs", icon: Waypoints, hint: "Jobs — swarm runs: lanes, workers and the event feed" },
   { id: "artifacts", label: "Artifacts", icon: Package, hint: "Artifacts — files the agent produced" },
 ];
@@ -444,7 +444,6 @@ export default function Workspace() {
   const send = useForge((s) => s.send);
   const toast = useForge((s) => s.toast);
 
-  const [hidden, setHidden] = useState(false);
   const [hintDismissed, setHintDismissed] = useState(false);
   const [termOpen, setTermOpen] = useState(false);
   const [termTab, setTermTab] = useState<"terminal" | "problems">("terminal");
@@ -487,17 +486,8 @@ export default function Workspace() {
 
   return (
     <div className="flex h-full min-w-0 flex-1 flex-col bg-card">
-      {/* hidden: thin rail that re-expands the workspace */}
-      {hidden ? (
-        <button
-          onClick={() => setHidden(false)}
-          className="flex w-11 shrink-0 flex-col items-center gap-2 border-l border-line bg-cream pt-4 text-muted transition hover:text-ink"
-          title="Expand workspace"
-        >
-          <PanelRightOpen size={16} />
-          <span className="text-[9.5px] font-bold [writing-mode:vertical-lr]">WORKSPACE</span>
-        </button>
-      ) : wsCollapsed ? (
+      {/* collapsed: 46px icon rail that re-expands the workspace (ForgeApp sizes this pane) */}
+      {wsCollapsed ? (
         <div className="flex h-full w-[46px] shrink-0 flex-col items-center border-r border-line bg-paper py-2">
           <button
             onClick={() => setWsCollapsed(false)}
@@ -544,15 +534,21 @@ export default function Workspace() {
                     aria-selected={active}
                     onClick={() => setWsMode(t.id)}
                     title={t.hint}
-                    className={cn("flex h-8 shrink-0 items-center gap-1.5 rounded-lg px-2.5 text-[12.5px] font-semibold transition sm:px-3",
-                      active ? "bg-ink text-white shadow-sm" : "text-ink-soft hover:bg-black/5 hover:text-ink")}
+                    className={cn(
+                      "relative flex h-8 shrink-0 items-center justify-center rounded-lg text-[12.5px] font-semibold transition-all duration-200",
+                      active ? "bg-ink px-3 text-white shadow-sm" : "w-8 px-2 text-ink-soft hover:bg-black/5 hover:text-ink",
+                    )}
                   >
-                    <Icon size={14} />
-                    <span className={cn(t.compact && "hidden lg:inline")}>{t.label}</span>
+                    <Icon size={14} className="shrink-0" />
+                    {active && <span className="ml-1.5 whitespace-nowrap">{t.label}</span>}
                     {t.id === "console" && errorCount > 0 && (
-                      <span className={cn("rounded-full px-1.5 text-[10px] font-bold", active ? "bg-white/20 text-white" : "bg-black/[0.07] text-ink-soft")}>
-                        {errorCount}
-                      </span>
+                      active ? (
+                        <span className="ml-1.5 rounded-full bg-white/20 px-1.5 text-[10px] font-bold">{errorCount}</span>
+                      ) : (
+                        <span className="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-[14px] items-center justify-center rounded-full bg-clay px-1 text-[8px] font-bold text-white">
+                          {errorCount}
+                        </span>
+                      )
                     )}
                   </button>
                 );
@@ -561,7 +557,7 @@ export default function Workspace() {
             <span className="hidden shrink-0 text-[11.5px] text-faint 2xl:block">{activeTab?.hint}</span>
 
             <button
-              onClick={() => setHidden(true)}
+              onClick={() => setWsCollapsed(true)}
               title="Hide workspace panel"
               className="ml-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted transition hover:bg-black/5 hover:text-ink"
             >

@@ -3,7 +3,7 @@
 
 export const MODE_RULES: Record<string, string> = {
   default: `## Operational Rules
-1. The platform manages dev servers and previews. Do not start long-running servers unless instructed.
+1. The platform manages dev servers and previews. NEVER start long-running dev servers yourself (npm run dev / vite / next dev / expo start) — the platform boots the right one automatically after your turn.
 2. Keep PLAN.md, TODO.md and WORKLOG.md updated as you work.
 3. Verify your work before claiming success (run, compile, test).
 4. Write real content; never leave placeholders.`,
@@ -60,10 +60,11 @@ export const MODE_RULES: Record<string, string> = {
 3. Professional structure; tables where useful.
 4. Maintain PLAN.md / TODO.md / WORKLOG.md.`,
   computer: `## System Capabilities
-- Browser automation skills (control-browser) available.
+- forge-browser MCP tools (forge_screenshot / forge_navigate / forge_get_text / forge_click) drive a REAL headless Chromium — use them with full URLs for screenshots and page verification.
+- The node_repl browser plugin (agent.browsers.*) is NOT available; never call it.
 
 ## Operational Rules
-1. Announce each step, act, capture screenshots under zcode/screenshots/.
+1. Announce each step, act, capture screenshots under zcode/screenshots/ (via forge_screenshot saving files or Writing the returned PNG path).
 2. Report what you observed, not assumptions.
 3. Maintain PLAN.md / TODO.md / WORKLOG.md.`,
   data: `## System Capabilities
@@ -89,14 +90,17 @@ export const MODE_RULES: Record<string, string> = {
 5. Maintain PLAN.md / TODO.md / WORKLOG.md (append a Task ID section per analysis pass).`,
 };
 
-export function agentsMdFor(modeName: string, rules: string): string {
+export function agentsMdFor(modeName: string, rules: string, envLines: string[] = []): string {
+  const envBlock = envLines.length
+    ? `\n## Live Environment\n${envLines.join("\n")}\n`
+    : "";
   return `# Workspace Configuration — ${modeName.toUpperCase()} MODE
 
 You are running inside ZCode Builder, a managed app-building platform.
 This file is your operational contract for this workspace.
 
 ${rules}
-
+${envBlock}
 ## ZCode Builder Contract
 - PLAN.md = what you plan to do; TODO.md = current checklist; WORKLOG.md = append-only journal.
 - After each significant unit of work, append to WORKLOG.md:

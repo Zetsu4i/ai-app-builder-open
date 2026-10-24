@@ -109,12 +109,25 @@ export async function routeSessionEvent(
       textChars: 0,
     };
     live.set(sessionId, lm);
-    // the user message mirrors what persistUserMessage already stored
+    // the user message mirrors the persisted row (clean text + pick/attachment chips);
+    // the core's `input` echo contains the internal context block — never show it
+    let userParts: Json[] = [{ type: "text", text: (payload as { input?: string }).input ?? "" }];
+    try {
+      const lastUser = await db.agentMessage.findFirst({
+        where: { projectId, role: "user" },
+        orderBy: { seq: "desc" },
+        select: { parts: true },
+      });
+      const parsed = JSON.parse(lastUser?.parts || "[]") as Json[];
+      if (Array.isArray(parsed) && parsed.length > 0) userParts = parsed;
+    } catch {
+      /* fall back to the echo */
+    }
     emit("message:user", {
       id: (payload as { messageId?: string }).messageId || `user-${Date.now()}`,
       sessionId: chatSession?.id ?? null,
       role: "user",
-      parts: [{ type: "text", text: (payload as { input?: string }).input ?? "" }],
+      parts: userParts,
       createdAt: new Date().toISOString(),
     });
     // CRITICAL: the client binds its live stream to this event — works after
@@ -395,11 +408,12 @@ export function colorForAgent(name: string): string {
 }
 
 // persist a user message immediately when a turn is accepted
-export async function persistUserMessage(projectId: string, content: string): Promise<void> {
+export async function persistUserMessage(projectId: string, content: string, parts?: Json[]): Promise<void> {
   const chatSession = await activeChatSession(projectId);
   const seq = await nextMessageSeq(projectId);
+  const storedParts: Json[] = parts && parts.length ? parts : [{ type: "text", text: content }];
   await db.agentMessage.create({
-    data: { projectId, sessionId: chatSession?.id ?? null, role: "user", parts: JSON.stringify([{ type: "text", text: content }]), seq },
+    data: { projectId, sessionId: chatSession?.id ?? null, role: "user", parts: JSON.stringify(storedParts), seq },
   });
   if (chatSession) {
     await db.chatSession.update({ where: { id: chatSession.id }, data: { updatedAt: new Date() } }).catch(() => undefined);

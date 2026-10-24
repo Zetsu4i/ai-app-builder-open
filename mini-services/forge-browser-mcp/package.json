@@ -1,0 +1,13 @@
+{
+  "name": "forge-browser-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "ZCode Builder MCP server — real headless-Chromium browser tools (screenshot / navigate / text / click) over stdio.",
+  "scripts": {
+    "dev": "bun run index.ts"
+  },
+  "dependencies": {
+    "playwright-core": "1.59.0"
+  }
+}

@@ -7,7 +7,9 @@ import * as api from "./api";
 import { getSocket, joinProject, leaveProject } from "./socket";
 import type {
   AgentEvent,
+  AgentEventKind,
   ArtifactDTO,
+  ChatAttachment,
   ChatMessage,
   CheckpointDTO,
   ComposerConfig,
@@ -176,6 +178,7 @@ interface ForgeState {
   webviewErrors: { message: string; level: string; count: number }[];
   consoleEntries: ConsoleEntry[];
   picks: PickedElement[];
+  attachments: ChatAttachment[];
 
   // artifacts
   artifacts: ArtifactDTO[];
@@ -223,6 +226,8 @@ interface ForgeState {
   addConsole: (e: Omit<ConsoleEntry, "id" | "createdAt">) => void;
   addPick: (p: PickedElement) => void;
   removePick: (i: number) => void;
+  addAttachment: (a: ChatAttachment) => void;
+  removeAttachment: (i: number) => void;
 
   handleSocketInit: () => void;
 }
@@ -291,6 +296,7 @@ export const useForge = create<ForgeState>((set, get) => ({
   webviewErrors: [],
   consoleEntries: [],
   picks: [],
+  attachments: [],
 
   artifacts: [],
   swarmRun: null,
@@ -390,6 +396,8 @@ export const useForge = create<ForgeState>((set, get) => ({
         editorContent: {},
         dirtyPaths: {},
         previewKey: 0,
+        picks: [],
+        attachments: [],
         wsMode: data.project.mode === "design" ? "preview" : "preview",
         composer: {
           ...composer,
@@ -493,6 +501,8 @@ export const useForge = create<ForgeState>((set, get) => ({
       todos: [],
       consoleEntries: [],
       webviewErrors: [],
+      picks: [],
+      attachments: [],
     });
   },
 
@@ -523,10 +533,26 @@ export const useForge = create<ForgeState>((set, get) => ({
   send: async (content) => {
     const p = get().activeProject;
     if (!p || get().isWorking) return;
+    // picked elements + attachments ride along with the next message
+    const picks = get().picks;
+    const attachments = get().attachments;
     const userMsg: ChatMessage = {
       id: `local-${Date.now()}`,
       role: "user",
-      parts: [{ type: "text", text: content }],
+      parts: [
+        { type: "text", text: content },
+        ...picks.map((pick) => ({ type: "picked-element", pick }) as MessagePart),
+        ...attachments.map(
+          (a) =>
+            ({
+              type: "attachment",
+              name: a.name,
+              mime: a.mime,
+              size: a.size,
+              path: `.zcode-attachments/${a.name}`,
+            }) as MessagePart,
+        ),
+      ],
       createdAt: new Date().toISOString(),
     };
     const liveId = `live-${Date.now()}`;
@@ -538,7 +564,14 @@ export const useForge = create<ForgeState>((set, get) => ({
       agentActivity: "Thinking…",
     });
     try {
-      await api.sendChat(p.id, { content, agentMode: get().composer.agentMode });
+      await api.sendChat(p.id, {
+        content,
+        agentMode: get().composer.agentMode,
+        attachments: attachments.map(({ name, mime, dataBase64 }) => ({ name, mime, dataBase64 })),
+        pickedElements: picks.map(({ selector, tag, text, styles, instructions }) => ({ selector, tag, text, styles, instructions })),
+      });
+      // sent — clear the pending picks/attachments so they don't ride the next turn
+      set({ picks: [], attachments: [] });
     } catch (e) {
       set({ isWorking: false, liveMessageId: null, lastError: { message: String(e), kind: "network" } });
     }
@@ -675,6 +708,8 @@ export const useForge = create<ForgeState>((set, get) => ({
     }),
   addPick: (p) => set({ picks: [...get().picks, p] }),
   removePick: (i) => set({ picks: get().picks.filter((_, idx) => idx !== i) }),
+  addAttachment: (a) => set({ attachments: [...get().attachments, a] }),
+  removeAttachment: (i) => set({ attachments: get().attachments.filter((_, idx) => idx !== i) }),
 
   handleSocketInit: () => {
     if (socketBound) return;
@@ -824,7 +859,9 @@ export const useForge = create<ForgeState>((set, get) => ({
         // auto checkpoints (project versions) land at turn end
         void get().refreshGit();
       }
-      switch (e.kind) {
+      // "console" events come from the backend but aren't in AgentEventKind yet —
+      // widen the discriminant locally so this case stays self-contained
+      switch (e.kind as AgentEventKind | "console") {
         case "sandbox": {
           const p = e.payload as { runtime?: string; status?: string; sandboxId?: string | null; error?: string };
           set({
@@ -853,6 +890,11 @@ export const useForge = create<ForgeState>((set, get) => ({
         case "terminal": {
           const p = e.payload as { stream?: string; data?: string };
           if (p.data) get().addConsole({ level: "info", text: p.data });
+          break;
+        }
+        case "console": {
+          const p = e.payload as { level?: "error" | "warn" | "info"; text?: string };
+          get().addConsole({ level: p.level ?? "info", text: p.text ?? "" });
           break;
         }
         case "error": {

@@ -323,8 +323,24 @@ interface DevServerEntry {
   status: "installing" | "starting" | "ready" | "error";
   logs: string[];
   framework: string;
+  healthTimer?: ReturnType<typeof setInterval>;
+  failCount: number;
+  lastErrEmit: number;
 }
 const devServers = new Map<string, DevServerEntry>();
+
+/** Dev-server log lines that mean real compile/runtime problems → Problems tab. */
+const DEV_ERR_PATTERNS: RegExp[] = [
+  /Pre-transform error/i,
+  /Internal server error/i,
+  /Failed to resolve/i,
+  /error during build/i,
+  /SyntaxError/,
+  /Module not found/i,
+  /Cannot find module/i,
+  /UnhandledPromiseRejection/,
+  /Error: .{6,}/,
+];
 
 function allocPort(): number {
   const used = new Set([...devServers.values()].map((d) => d.port));
@@ -367,6 +383,7 @@ async function allocFreePort(): Promise<number> {
 export async function devServerAction(projectId: string, action: "start" | "stop" | "restart", framework: string, mode: string): Promise<Record<string, unknown>> {
   const dir = projectWorkspaceDir(projectId);
   if (action === "stop" || action === "restart") {
+    stopHealthMonitor(devServers.get(projectId));
     const existing = devServers.get(projectId);
     if (existing) {
       try {
@@ -400,36 +417,141 @@ export async function devServerAction(projectId: string, action: "start" | "stop
 
   await emitProjectEvent(projectId, "devserver", { status: "installing" });
   const proc = spawn("bash", ["-lc", cmd], { cwd: dir, env: { ...process.env, PORT: String(port), FORCE_COLOR: "0" } });
-  const entry: DevServerEntry = { proc, port, status: "starting", logs: [], framework };
+  const entry: DevServerEntry = { proc, port, status: "starting", logs: [], framework, failCount: 0, lastErrEmit: 0 };
   devServers.set(projectId, entry);
   proc.stdout!.on("data", (d: Buffer) => {
     const s = d.toString();
     entry.logs.push(s);
     if (entry.logs.length > 400) entry.logs.splice(0, 200);
+    captureDevErrors(projectId, entry, s);
     if (entry.status !== "ready" && /(Local:|ready in|localhost:\d+|Running on|listening)/i.test(s)) {
       entry.status = "ready";
       void emitProjectEvent(projectId, "devserver", { status: "ready", port });
       void emitProjectEvent(projectId, "preview", { reload: true });
+      startHealthMonitor(projectId, entry);
     }
   });
   proc.stderr!.on("data", (d: Buffer) => {
     const s = d.toString();
     entry.logs.push(s);
     if (entry.logs.length > 400) entry.logs.splice(0, 200);
+    captureDevErrors(projectId, entry, s);
   });
-  proc.on("exit", () => {
+  proc.on("exit", (code) => {
+    stopHealthMonitor(entry);
     if (devServers.get(projectId) === entry) {
       entry.status = "error";
+      devServers.delete(projectId);
+      void emitProjectEvent(projectId, "console", {
+        level: "error",
+        text: `Dev server exited unexpectedly (code ${code ?? "?"}). Restarting…`,
+      });
       void emitProjectEvent(projectId, "devserver", { status: "stopped" });
+      // bring it back by itself so the preview never stays dead
+      void import("./devserver-autostart").then(({ maybeAutoStartDevServer }) =>
+        maybeAutoStartDevServer(projectId, "health").catch(() => undefined),
+      );
     }
   });
   return { status: "starting", port };
+}
+
+/** Rate-limited forward of dev-server compile/runtime errors to the Problems tab. */
+function captureDevErrors(projectId: string, entry: DevServerEntry, chunk: string): void {
+  for (const rawLine of chunk.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (!DEV_ERR_PATTERNS.some((re) => re.test(line))) continue;
+    const now = Date.now();
+    if (now - entry.lastErrEmit < 2000) continue;
+    entry.lastErrEmit = now;
+    void emitProjectEvent(projectId, "console", { level: "error", text: `[dev server] ${line.slice(0, 600)}` });
+  }
+}
+
+function stopHealthMonitor(entry: DevServerEntry | undefined): void {
+  if (entry?.healthTimer) {
+    clearInterval(entry.healthTimer);
+    entry.healthTimer = undefined;
+  }
+}
+
+/** Ping the dev server every 3s once ready; 3 consecutive failures = crashed → report + auto-restart. */
+function startHealthMonitor(projectId: string, entry: DevServerEntry): void {
+  stopHealthMonitor(entry);
+  const probe = entry.framework === "react-vite" ? `/preview/${projectId}/` : "/";
+  entry.healthTimer = setInterval(() => {
+    if (entry.status !== "ready") return;
+    fetch(`http://127.0.0.1:${entry.port}${probe}`, { signal: AbortSignal.timeout(2500) })
+      .then(() => {
+        entry.failCount = 0;
+      })
+      .catch(() => {
+        if (entry.status !== "ready") return;
+        entry.failCount++;
+        if (entry.failCount >= 3) {
+          entry.failCount = 0;
+          entry.status = "error";
+          stopHealthMonitor(entry);
+          try {
+            entry.proc.kill("SIGKILL");
+          } catch {
+            /* noop */
+          }
+          void emitProjectEvent(projectId, "console", {
+            level: "error",
+            text: `[dev server] stopped responding on :${entry.port} — restarting it automatically`,
+          });
+          void emitProjectEvent(projectId, "devserver", { status: "stopped" });
+          void import("./devserver-autostart").then(({ maybeAutoStartDevServer }) =>
+            maybeAutoStartDevServer(projectId, "health").catch(() => undefined),
+          );
+        }
+      });
+  }, 3000);
+  entry.healthTimer.unref?.();
 }
 
 export function devServerInfo(projectId: string): { status: string; port?: number; logs?: string[] } {
   const e = devServers.get(projectId);
   if (!e) return { status: "stopped" };
   return { status: e.status, port: e.port, logs: e.logs.slice(-80) };
+}
+
+// ---------------- port discovery (preview port selector) ----------------
+
+/** Ports with something listening whose owner process runs inside this workspace. */
+export async function discoverWorkspacePorts(projectId: string): Promise<{ port: number; managed: boolean; cmd: string }[]> {
+  const dir = projectWorkspaceDir(projectId);
+  const managed = devServers.get(projectId);
+  const out = new Map<number, { port: number; managed: boolean; cmd: string }>();
+  if (managed) out.set(managed.port, { port: managed.port, managed: true, cmd: `platform dev server (${managed.framework})` });
+  try {
+    const proc = Bun.spawnSync(["ss", "-ltnp"], { timeout: 5000 });
+    const text = new TextDecoder().decode(proc.stdout || new Uint8Array());
+    for (const line of text.split("\n")) {
+      const pm = line.match(/127\.0\.0\.1:(\d+)\s/) || line.match(/0\.0\.0\.0:(\d+)\s/) || line.match(/\[::\]:(\d+)\s/) || line.match(/\*:(\d+)\s/);
+      if (!pm) continue;
+      const port = Number(pm[1]);
+      if (port < 1024 || port > 65535 || out.has(port)) continue;
+      const pidm = line.match(/pid=(\d+)/);
+      if (!pidm) continue;
+      const pid = Number(pidm[1]);
+      try {
+        const cwd = fs.readlinkSync(`/proc/${pid}/cwd`);
+        if (!cwd.startsWith(dir)) continue;
+        const cmdBuf = fs.readFileSync(`/proc/${pid}/cmdline`);
+        const cmd = cmdBuf.toString("utf8").split("\0").filter(Boolean).join(" ").slice(0, 90);
+        if (cmd.includes("agent-service") || cmd.includes("next-server") && port === 3000) continue;
+        out.set(port, { port, managed: false, cmd });
+      } catch {
+        /* process vanished or not ours */
+      }
+    }
+  } catch {
+    /* ss unavailable */
+  }
+  return [...out.values()].sort((a, b) => Number(b.managed) - Number(a.managed) || a.port - b.port);
 }
 
 // ---------------- terminal exec (streaming) ----------------

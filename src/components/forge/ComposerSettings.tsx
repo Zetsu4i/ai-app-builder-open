@@ -400,7 +400,7 @@ export function ComposerConfigPanel({ onClose }: { onClose: () => void }) {
   };
 
   return (
-    <div className="flex max-h-[70vh] w-[340px] flex-col overflow-hidden rounded-xl border border-line bg-card text-ink shadow-2xl">
+    <div className="flex min-h-0 w-full flex-col overflow-hidden text-ink">
       {/* header */}
       <div className="flex shrink-0 items-center gap-2 border-b border-line-soft px-3 py-2.5">
         <SlidersHorizontal size={12} className="text-muted" />
@@ -421,7 +421,7 @@ export function ComposerConfigPanel({ onClose }: { onClose: () => void }) {
       <div className="min-h-0 flex-1 overflow-y-auto">
         {/* mode */}
         <Section icon={Blocks} title="Mode">
-          <div className="space-y-1">
+          <div className="grid gap-1.5 sm:grid-cols-2">
             {modes.map((m) => {
               const I = modeIconFor(m.slug);
               const on = config.mode === m.slug;
@@ -468,7 +468,7 @@ export function ComposerConfigPanel({ onClose }: { onClose: () => void }) {
 
         {/* design system */}
         <Section icon={Info} title="Design system">
-          <div className="space-y-1">
+          <div className="grid gap-1.5 sm:grid-cols-2">
             {designSystems.map((d) => {
               const on = config.designSystem === d.slug;
               const colors = dsColors(d.slug);
@@ -587,7 +587,7 @@ export function ComposerConfigPanel({ onClose }: { onClose: () => void }) {
           {skills.length === 0 ? (
             <p className="px-1 py-2 text-[11px] text-muted">No skills installed yet.</p>
           ) : (
-            <div className="space-y-1">
+            <div className="grid gap-1.5 sm:grid-cols-2">
               {skills.map((s) => (
                 <ToggleRow
                   key={s.slug}
@@ -606,7 +606,7 @@ export function ComposerConfigPanel({ onClose }: { onClose: () => void }) {
           {mcps.length === 0 ? (
             <p className="px-1 py-2 text-[11px] text-muted">No MCP servers configured.</p>
           ) : (
-            <div className="space-y-1">
+            <div className="grid gap-1.5 sm:grid-cols-2">
               {mcps.map((m) => (
                 <ToggleRow
                   key={m.id}

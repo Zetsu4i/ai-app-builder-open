@@ -143,8 +143,6 @@ export default function HomeScreen() {
   const [configOpen, setConfigOpen] = useState(false);
   const modeBtnRef = useRef<HTMLButtonElement>(null);
   const modeRef = useRef<HTMLDivElement>(null);
-  const composerCardRef = useRef<HTMLDivElement>(null);
-  const configWrapRef = useRef<HTMLDivElement>(null);
 
   // load modes (builtin + custom) from the backend
   useEffect(() => {
@@ -199,38 +197,6 @@ export default function HomeScreen() {
       window.removeEventListener("scroll", place, true);
     };
   }, [modeOpen]);
-
-  /* ---------- task-setup panel placement (anchored under the composer card) ---------- */
-
-  useEffect(() => {
-    if (!configOpen) return;
-    const place = () => {
-      const card = composerCardRef.current;
-      const wrap = configWrapRef.current;
-      if (!card || !wrap) return;
-      const panel = wrap.firstElementChild as HTMLElement | null;
-      if (!panel) return;
-      const r = card.getBoundingClientRect();
-      const w = panel.offsetWidth || 340;
-      const maxH = Math.max(280, Math.min(window.innerHeight * 0.7, window.innerHeight - r.bottom - 20));
-      panel.style.maxHeight = `${maxH}px`;
-      wrap.style.visibility = "visible";
-      wrap.style.top = `${r.bottom + 8}px`;
-      let left = r.right - w;
-      if (left < 8) left = 8;
-      if (left + w > window.innerWidth - 8) left = window.innerWidth - w - 8;
-      wrap.style.left = `${left}px`;
-    };
-    place();
-    const id = window.setTimeout(place, 16);
-    window.addEventListener("resize", place);
-    window.addEventListener("scroll", place, true);
-    return () => {
-      window.clearTimeout(id);
-      window.removeEventListener("resize", place);
-      window.removeEventListener("scroll", place, true);
-    };
-  }, [configOpen]);
 
   /* ---------- actions ---------- */
 
@@ -288,7 +254,6 @@ export default function HomeScreen() {
 
         {/* composer */}
         <div
-          ref={composerCardRef}
           className={cn(
             "anim-fade-up stagger-2 relative mt-7 rounded-2xl border bg-card shadow-[0_16px_48px_-20px_rgba(28,25,23,0.3)] transition",
             modeOpen ? "border-ink/30" : "border-line",
@@ -485,19 +450,19 @@ export default function HomeScreen() {
           </div>
         </div>
 
-        {/* task-setup panel — opens from the + / Edit / Skills / MCPs buttons */}
+        {/* task-setup modal — opens from the + / Edit / Skills / MCPs buttons */}
         {configOpen &&
           createPortal(
-            <>
-              <div className="fixed inset-0 z-[90]" onClick={() => setConfigOpen(false)} />
-              <div
-                ref={configWrapRef}
-                style={{ visibility: "hidden" }}
-                className="anim-fade-up fixed z-[100]"
-              >
-                <ComposerConfigPanel onClose={() => setConfigOpen(false)} />
+            <div className="fixed inset-0 z-[100] bg-ink/40 backdrop-blur-[2px]" onClick={() => setConfigOpen(false)}>
+              <div className="flex min-h-full items-center justify-center p-4">
+                <div
+                  onClick={(e) => e.stopPropagation()}
+                  className="anim-fade-up flex max-h-[84vh] w-[min(880px,94vw)] flex-col overflow-hidden rounded-2xl border border-line bg-card shadow-2xl"
+                >
+                  <ComposerConfigPanel onClose={() => setConfigOpen(false)} />
+                </div>
               </div>
-            </>,
+            </div>,
             document.body,
           )}
 
