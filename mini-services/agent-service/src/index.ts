@@ -23,6 +23,9 @@ import {
   syncDown,
   sandboxDevServerAction,
   sandboxDevServerInfo,
+  discoverSandboxPorts,
+  setSandboxEvents,
+  bootRecentlyFailed,
 } from "./sandbox";
 import { resolveMode, seedWorkspaceIfNeeded, generateTitle, nextWorklogTaskId, appendWorklogRunHeader } from "./workspace";
 import {
@@ -143,6 +146,7 @@ initRuntime({
   },
 });
 setSandboxBridge({ isE2B: (projectId) => isE2BActive(projectId), getRelayUrl: (projectId) => getRelayUrl(projectId) });
+setSandboxEvents((projectId, kind, payload) => emitProjectEvent(projectId, kind, payload));
 
 const policyCache = new Map<string, { policy: "yolo" | "auto" | "ask"; at: number }>();
 async function policyFor(projectId: string): Promise<"yolo" | "auto" | "ask"> {
@@ -377,6 +381,23 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
       if (!pending) pending = { type: pendingRef.kind, requestId: pendingRef.requestId };
     }
     void maybeAutoStartDevServer(id, "hydrate");
+    // cloud sandbox: re-attach after a service restart so the project is usable again
+    void (async () => {
+      try {
+        if (e2bConfigured() && !isE2BActive(id) && !bootRecentlyFailed(id) && row.sandboxRuntime !== "local") {
+          await emitProjectEvent(id, "sandbox", { status: "provisioning", runtime: "e2b" });
+          const boot = await bootSandbox(id, row.mode);
+          if (boot.runtime === "e2b") {
+            await db.project.update({ where: { id }, data: { sandboxRuntime: "e2b", sandboxId: boot.sandboxId } });
+            await emitProjectEvent(id, "sandbox", { status: "running", runtime: "e2b", sandboxId: boot.sandboxId });
+          } else {
+            await emitProjectEvent(id, "sandbox", { status: "fallback-local", runtime: "local", error: boot.error });
+          }
+        }
+      } catch {
+        /* hydrate must not fail because of sandbox boot */
+      }
+    })();
     return json(res, 200, {
       project: projectDto(row),
       sessionId: session.id,
@@ -490,14 +511,15 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
         await seedWorkspaceIfNeeded(id, row.mode, row.framework, modeConfig);
         await emitProjectEvent(id, "status", { activity: "Preparing workspace…" });
 
-        if (e2bConfigured() && !isE2BActive(id) && row.sandboxRuntime !== "local") {
+        if (e2bConfigured() && !isE2BActive(id) && !bootRecentlyFailed(id) && row.sandboxRuntime !== "local") {
           await emitProjectEvent(id, "sandbox", { status: "provisioning", runtime: "e2b" });
           const boot = await bootSandbox(id, row.mode);
           if (boot.runtime === "e2b") {
             await db.project.update({ where: { id }, data: { sandboxRuntime: "e2b", sandboxId: boot.sandboxId } });
             await emitProjectEvent(id, "sandbox", { status: "running", runtime: "e2b", sandboxId: boot.sandboxId });
           } else {
-            await db.project.update({ where: { id }, data: { sandboxRuntime: "local" } });
+            // transient fallback for THIS turn — the project keeps sandboxRuntime "e2b"
+            // so the next turn retries (bootRecentlyFailed throttles hammering)
             await emitProjectEvent(id, "sandbox", { status: "fallback-local", runtime: "local", error: boot.error });
           }
         }
@@ -787,6 +809,10 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
     if (method === "GET") return json(res, 200, isE2BActive(id) ? sandboxDevServerInfo(id) : devServerInfo(id));
     if (method === "POST") {
       const row = await db.project.findUnique({ where: { id } });
+      // make sure the cloud sandbox exists before trying to start its dev server
+      if (e2bConfigured() && !isE2BActive(id) && !bootRecentlyFailed(id) && row?.sandboxRuntime !== "local") {
+        await bootSandbox(id, row?.mode || "web");
+      }
       const isE2B = isE2BActive(id);
       if (isE2B) {
         const result = await sandboxDevServerAction(id, body.action === "stop" ? "stop" : "start", row?.framework || "react-vite");
@@ -801,7 +827,7 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
   // ---------- ports (preview port selector) ----------
   m = p.match(/^\/api\/projects\/([^/]+)\/ports$/);
   if (m && method === "GET") {
-    const ports = isE2BActive(m[1]) ? [] : await discoverWorkspacePorts(m[1]);
+    const ports = isE2BActive(m[1]) ? await discoverSandboxPorts(m[1]) : await discoverWorkspacePorts(m[1]);
     return json(res, 200, { ports });
   }
 
@@ -1114,6 +1140,19 @@ function injectForgeBridge(buf: Buffer): string {
 
 /** Forward to a secondary port the agent opened: /preview/<id>/p/<port>/... */
 async function serveSecondaryPort(projectId: string, port: number, rest: string, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  // E2B: the listener lives inside the sandbox → bounce to its cloud URL
+  if (isE2BActive(projectId)) {
+    const entry = sandboxInfo(projectId);
+    if (entry.sandboxId) {
+      const { getE2BSandboxHost } = await import("./sandbox");
+      const host = getE2BSandboxHost(projectId);
+      if (host) {
+        res.writeHead(302, { Location: `https://${port}-${host}${rest || "/"}` });
+        res.end();
+        return;
+      }
+    }
+  }
   const target = `http://127.0.0.1:${port}${rest || "/"}${url_suffix(req)}`;
   try {
     const headers: Record<string, string> = {};

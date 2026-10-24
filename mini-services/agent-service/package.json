@@ -7,6 +7,7 @@
     "start": "bun src/index.ts"
   },
   "dependencies": {
+    "e2b": "^2.59.0",
     "socket.io": "^4.8.1"
   }
 }

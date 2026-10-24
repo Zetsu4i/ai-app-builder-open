@@ -160,13 +160,53 @@ class E2BConnection implements CoreConnection {
   private nextId = 1;
   private stopped = false;
   private responseWaiters = new Map<string, { resolve: (v: Json) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  // readiness gate: a freshly started core drops rpc requests that arrive during
+  // startup (session/create would hang forever). Hold requests until the core
+  // signals readiness (startup/storageState phase=ready) or answers a probe.
+  private gateOpen = false;
+  private gate: Promise<void>;
+  private openGateFn: () => void = () => undefined;
+  private gateCap: ReturnType<typeof setTimeout>;
 
   constructor(
     baseUrl: string,
-    private handlers: { notification(method: string, params: Json): void; serverRequest(id: string, method: string, params: Json): void; exit(): void },
+    private handlers: {
+      notification(method: string, params: Json): void;
+      serverRequest(id: string, method: string, params: Json): void;
+      exit(): void;
+      /** LLM requests tunneled from the sandbox's relay — executed against the host bridge. */
+      tunnelLLM?(id: string, body: Json): Promise<void>;
+    },
   ) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
+    this.gate = new Promise<void>((r) => {
+      this.openGateFn = r;
+    });
+    this.gateCap = setTimeout(() => this.openGate(), 30000);
+    // liveness probe: a live core answers an invalid method instantly → opens the gate
+    void this.probe();
     void this.pollLoop(0);
+  }
+
+  private openGate(): void {
+    if (this.gateOpen) return;
+    this.gateOpen = true;
+    clearTimeout(this.gateCap);
+    this.openGateFn();
+  }
+
+  private async probe(): Promise<void> {
+    await new Promise((r) => setTimeout(r, 300));
+    try {
+      await fetch(`${this.baseUrl}/rpc`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: "probe-gate", method: "__probe__", params: {} }),
+        signal: AbortSignal.timeout(8000),
+      });
+    } catch {
+      /* relay unreachable — the gate cap or the ready event will release */
+    }
   }
 
   private async pollLoop(cursor: number) {
@@ -184,6 +224,23 @@ class E2BConnection implements CoreConnection {
             this.handlers.exit();
             return;
           }
+          // tunneled LLM request from the in-sandbox bridge → execute on the host
+          if (typeof (line as { __tunnel?: string }).__tunnel === "string") {
+            void this.handlers.tunnelLLM?.(
+              (line as { __tunnel: string }).__tunnel,
+              (line as { body?: Json }).body ?? {},
+            );
+            continue;
+          }
+          // gate release: core readiness signal or proof of a live core (probe/response)
+          if (!this.gateOpen) {
+            const msg = line as { id?: unknown; method?: unknown; params?: { phase?: string } };
+            const isReady = msg.method === "startup/storageState" && msg.params?.phase === "ready";
+            const idStr = typeof msg.id === "string" ? msg.id : "";
+            const provesLive = idStr.startsWith("probe-") || (idStr !== "" && this.responseWaiters.has(idStr));
+            if (isReady || provesLive) this.openGate();
+          }
+          await this.gate;
           this.dispatch(line);
         }
       } catch {
@@ -211,21 +268,28 @@ class E2BConnection implements CoreConnection {
   }
 
   async request(method: string, params: Json, timeoutMs = 180000): Promise<Json> {
+    await this.gate; // never send into a starting core — it drops early requests
     const id = `req-${this.nextId++}`;
-    const waiter = new Promise<Json>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.responseWaiters.delete(id);
-        reject(new Error(`timeout: ${method}`));
-      }, timeoutMs);
-      this.responseWaiters.set(id, { resolve, reject, timer });
-    });
-    await fetch(`${this.baseUrl}/rpc`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ id, method, params }),
-      signal: AbortSignal.timeout(20000),
-    });
-    return waiter;
+    // The relay's /rpc returns the core's result in the HTTP body (it consumes the
+    // matching stdout line, so the response never appears on /poll). Read it here —
+    // do NOT wait on the poll stream for it.
+    const relayWait = Math.max(5000, Math.min(timeoutMs - 5_000, 150_000));
+    try {
+      const res = await fetch(`${this.baseUrl}/rpc?timeout=${relayWait}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id, method, params }),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!res.ok) throw new Error(`rpc http ${res.status}`);
+      const body = (await res.json()) as { id?: string; result?: Json; error?: Json };
+      if (body.error) throw new Error(JSON.stringify(body.error));
+      return (body.result ?? {}) as Json;
+    } catch (e) {
+      // keep the waiter table tidy; responses for this id can no longer arrive
+      this.responseWaiters.delete(id);
+      throw e;
+    }
   }
 
   notify(method: string, params: Json) {
@@ -432,6 +496,34 @@ export class ZCodeRuntime {
           notification: (m, p) => this.handleNotification(m, p),
           serverRequest: (id, m, p) => void this.handleServerRequest(conn, id, m, p),
           exit: () => this.conns.delete(projectId),
+          // execute the sandbox's tunneled LLM request against the host bridge, then answer the relay
+          tunnelLLM: async (tunnelId, body) => {
+            try {
+              const { handleBridge } = await import("./bridge");
+              const res = await handleBridge(
+                new Request("http://bridge/llm/v1/chat/completions", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify(body),
+                }),
+              );
+              const text = await res.text();
+              await fetch(`${url.replace(/\/$/, "")}/tunnel-response`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ id: tunnelId, status: res.status, contentType: res.headers.get("content-type") || "application/json", body: text }),
+                signal: AbortSignal.timeout(20000),
+              });
+            } catch (e) {
+              console.warn(`[runtime] tunnel LLM failed:`, (e as Error).message);
+              await fetch(`${url.replace(/\/$/, "")}/tunnel-response`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ id: tunnelId, status: 502, contentType: "application/json", body: JSON.stringify({ error: { message: `host tunnel execution failed: ${(e as Error).message}` } }) }),
+                signal: AbortSignal.timeout(20000),
+              }).catch(() => undefined);
+            }
+          },
         });
         this.conns.set(projectId, conn);
         return conn;
@@ -640,6 +732,7 @@ export class ZCodeRuntime {
       this.projectIdBySession.delete(sid);
     }
     this.mcpsByProject.delete(projectId);
+    this.runtimeKindByProject.delete(projectId);
   }
 
   // ---- session registry ----
@@ -678,12 +771,17 @@ export class ZCodeRuntime {
   }): Promise<string> {
     const conn = await this.ensureConn(opts.projectId);
     const selection = modelSelection(opts.model);
+    // in a cloud sandbox the core sees ITS OWN filesystem — host paths and
+    // host-side stdio MCP servers are meaningless there
+    const isE2B = conn.kind === "e2b";
+    const workspacePath = isE2B ? "/home/user/workspace" : opts.workspacePath;
+    const mcpServers = isE2B ? [] : opts.mcpServers;
 
-    if (opts.resumeSessionId) {
+    if (opts.resumeSessionId && !isE2B) {
       try {
         const res = await conn.request("session/resume", {
           sessionId: opts.resumeSessionId,
-          workspace: { workspacePath: opts.workspacePath, workspaceKey: opts.workspacePath },
+          workspace: { workspacePath, workspaceKey: opts.workspacePath },
         });
         const sessionId = (res.session as { sessionId?: string })?.sessionId || opts.resumeSessionId;
         this.registerSession(opts.projectId, sessionId, opts.workspacePath);
@@ -695,12 +793,12 @@ export class ZCodeRuntime {
     }
 
     const params: Json = {
-      workspace: { workspacePath: opts.workspacePath, workspaceKey: opts.workspacePath },
+      workspace: { workspacePath, workspaceKey: opts.workspacePath },
       mode: opts.mode,
       persistence: "immediate",
     };
     if (selection) params.model = selection;
-    if (opts.mcpServers?.length) params.mcpServers = opts.mcpServers;
+    if (mcpServers?.length) params.mcpServers = mcpServers;
     if (opts.toolDenylist?.length) params.toolDenylist = opts.toolDenylist;
     if (process.env.ZCODE_DEBUG_EVENTS) console.log(`[create] params:`, JSON.stringify(params).slice(0, 400));
     const res = await conn.request("session/create", params);
@@ -719,6 +817,16 @@ export class ZCodeRuntime {
     // session so the tools are actually available to the agent
     const wanted = (mcpServers ?? []).map((m) => String((m as { name?: string }).name ?? "")).filter(Boolean).sort().join(",");
     const bound = this.mcpsByProject.get(projectId) ?? "";
+    // the session lives inside a specific core process — if the runtime kind
+    // changed (local ↔ e2b sandbox) the stored session is unknown to the new
+    // core and every send would silently hang: force a fresh session
+    const conn = await this.ensureConn(projectId);
+    const kindNow = conn.kind;
+    const kindBound = this.runtimeKindByProject.get(projectId);
+    if (existing && kindBound && kindBound !== kindNow) {
+      this.resetSession(projectId);
+      return this.ensureForProject(projectId, workspacePath, model, mcpServers);
+    }
     if (existing) {
       if (wanted && wanted !== bound) {
         this.resetSession(projectId);
@@ -739,12 +847,14 @@ export class ZCodeRuntime {
       resumeSessionId: forceFresh ? null : proj?.coreSessionId || null,
     });
     this.mcpsByProject.set(projectId, wanted);
+    this.runtimeKindByProject.set(projectId, kindNow);
     await db.project.update({ where: { id: projectId }, data: { coreSessionId: sessionId } });
     return sessionId;
   }
 
   private modelByProject = new Map<string, string>();
   private mcpsByProject = new Map<string, string>();
+  private runtimeKindByProject = new Map<string, "local" | "e2b">();
 
   async send(projectId: string, content: string): Promise<boolean> {
     const conn = await this.ensureConn(projectId);

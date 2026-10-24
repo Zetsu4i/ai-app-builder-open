@@ -91,7 +91,9 @@ export default function PreviewPane() {
   const managedPort = devServer.port ?? 3000;
   const port = activePort ?? managedPort;
   const secondaryPort = activePort != null && activePort !== managedPort ? activePort : null;
-  const frameSrc = secondaryPort != null && projectId ? previewPortBase(projectId, secondaryPort) : src;
+  // secondary port frame target: absolute cloud URL when the backend provides one (e2b), else the local proxy
+  const secondaryEntry = ports.find((p) => p.port === secondaryPort);
+  const frameSrc = secondaryPort != null && projectId ? secondaryEntry?.url ?? previewPortBase(projectId, secondaryPort) : src;
   const isStopped = devServer.status === "stopped";
 
   /** Push the pick-mode handshake into the iframe once it has loaded. */
@@ -202,7 +204,7 @@ export default function PreviewPane() {
 
   const onFrameLoad = () => {
     handshake();
-    if (useCloud) {
+    if (useCloud || (secondaryEntry?.url && secondaryPort != null)) {
       scheduleWarmupRetry();
       return;
     }
@@ -231,20 +233,22 @@ export default function PreviewPane() {
   };
 
   const copyLink = async () => {
-    const url = useCloud && devServer.cloudUrl ? devServer.cloudUrl : `${window.location.origin}${frameSrc}`;
+    const url = secondaryEntry?.url && secondaryPort != null ? secondaryEntry.url : useCloud && devServer.cloudUrl ? devServer.cloudUrl : `${window.location.origin}${frameSrc}`;
     try { await navigator.clipboard.writeText(url); } catch { /* noop */ }
     setCopied(true);
     setTimeout(() => setCopied(false), 1200);
   };
 
   const openExternal = () => {
-    const url = useCloud && devServer.cloudUrl ? devServer.cloudUrl : frameSrc;
+    const url = secondaryEntry?.url && secondaryPort != null ? secondaryEntry.url : useCloud && devServer.cloudUrl ? devServer.cloudUrl : frameSrc;
     window.open(url, "_blank", "noopener");
   };
 
-  const hostLabel = useCloud && devServer.cloudUrl
-    ? devServer.cloudUrl.replace(/^https?:\/\//, "")
-    : `localhost:${port}${path}`;
+  const hostLabel = secondaryEntry?.url && secondaryPort != null
+    ? secondaryEntry.url.replace(/^https?:\/\//, "")
+    : useCloud && devServer.cloudUrl
+      ? devServer.cloudUrl.replace(/^https?:\/\//, "")
+      : `localhost:${port}${path}`;
 
   if (!project) {
     return <div className="h-full min-w-0 flex-1 bg-paper" />;

@@ -167,6 +167,18 @@ export async function routeSessionEvent(
       if (type === "turn.completed" && lm.toolCount > 0) {
         void (async () => {
           try {
+            // E2B: pull the agent's sandbox file changes back to the host workspace
+            // BEFORE checkpointing / refreshing the file tree — otherwise the next
+            // syncUp would clobber in-sandbox changes with stale host files.
+            try {
+              const { isE2BActive, syncDown } = await import("./sandbox");
+              if (isE2BActive(projectId)) {
+                await syncDown(projectId);
+                await emitProjectEvent(projectId, "status", { workspaceSynced: true });
+              }
+            } catch (e) {
+              console.warn(`[turn] sandbox syncDown failed:`, (e as Error).message);
+            }
             const { gitCheckpoint } = await import("./services");
             const lastUser = [...lm.parts].reverse().find((x) => (x as { type?: string }).type === "text");
             const summary = (textFromPayloadContent([lastUser]) || "turn").slice(0, 60);

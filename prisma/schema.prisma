@@ -19,7 +19,7 @@ model Project {
   status         String   @default("active")
   sandboxId      String?
   sandboxStatus  String   @default("stopped") // stopped|provisioning|running|error
-  sandboxRuntime String   @default("local") // local|e2b
+  sandboxRuntime String   @default("e2b") // local|e2b — e2b attempted when a key is configured; falls back to local on boot failure
   agentMode      String   @default("yolo") // plan|build|edit|yolo|auto — yolo is the default
   swarmEnabled   Boolean  @default(false)
   agentsActive   String   @default("[]")

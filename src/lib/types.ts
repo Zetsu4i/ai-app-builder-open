@@ -179,6 +179,7 @@ export interface DevServerPort {
   port: number;
   managed: boolean; // true = the platform-managed dev server
   cmd: string; // process command line (label)
+  url?: string; // absolute frame target when the port lives in a cloud sandbox (e2b)
 }
 
 /** A file attached from the composer (sent with the next message). */

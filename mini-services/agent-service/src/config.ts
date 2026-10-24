@@ -2,6 +2,30 @@
 import path from "node:path";
 import fs from "node:fs";
 
+/** Minimal .env loader — parses the project root .env (never overrides real env vars). */
+function loadDotEnv(): void {
+  const candidates = [process.env.AGENT_SERVICE_ENV_FILE, path.resolve(import.meta.dir, "../../../.env")];
+  for (const file of candidates) {
+    if (!file) continue;
+    try {
+      if (!fs.existsSync(file)) continue;
+      for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+        const t = line.trim();
+        if (!t || t.startsWith("#")) continue;
+        const eq = t.indexOf("=");
+        if (eq <= 0) continue;
+        const k = t.slice(0, eq).trim();
+        let v = t.slice(eq + 1).trim();
+        if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+        if (process.env[k] === undefined) process.env[k] = v;
+      }
+    } catch {
+      /* ignore unreadable .env */
+    }
+  }
+}
+loadDotEnv();
+
 export const SERVICE_PORT = Number(process.env.AGENT_SERVICE_PORT || 3031);
 
 export const ROOT = path.resolve(import.meta.dir, "../../.."); // src → agent-service → mini-services → project root
