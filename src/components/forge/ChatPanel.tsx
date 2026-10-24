@@ -3,19 +3,24 @@
 // ZCode Builder — the chat panel. Ported from Forge ChatPanel.tsx and rewired
 // from prop-drilling to the zustand store: real messages stream in over the
 // socket, permissions/questions go through the BFF, artifacts are real files.
+// Parts render in strict chronological order; consecutive read/edit/terminal
+// style tool calls collapse into a "Steps" dropdown; plan cards are dropdowns.
 
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
-  ArrowUp, Bot, Check, ChevronDown, ChevronRight, Copy, FilePenLine,
+  ArrowUp, Bot, Bookmark, Check, ChevronDown, ChevronRight, Copy, FilePenLine,
   History, Lightbulb, ListChecks, Loader2, MessageSquarePlus, Mic, Paperclip,
   Plus, RotateCcw, Settings2, Square, ThumbsDown, ThumbsUp, X, Camera,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
 import { useForge } from "@/lib/store";
+import { relTime } from "./forge-utils";
 import type {
-  ApprovalPart, ChatMessage, CheckpointPart, TextPart, ToolInvocationPart,
+  ApprovalPart, ChatMessage, CheckpointDTO, CheckpointPart, DelegationPart,
+  MessagePart, PlanPart, QuestionPart, ReasoningPart, TextPart,
+  ToolInvocationPart,
 } from "@/lib/types";
 import { renderMarkdown } from "./render-markdown";
 import { ToolRow } from "./ToolCards";
@@ -80,6 +85,82 @@ const SAMPLE_PROMPTS: Record<string, string[]> = {
 };
 
 const FILE_TOOLS = ["Read", "Write", "Edit", "NotebookEdit", "ApplyPatch"];
+
+/** tool calls collapsed into a "Steps" dropdown — everything else renders as its own card */
+const GROUPABLE = new Set([
+  "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "ApplyPatch",
+  "Bash", "Grep", "Glob", "TodoRead", "WebFetch", "WebSearch",
+]);
+
+const isBusyTool = (t: ToolInvocationPart) =>
+  t.state === "running" || t.state === "input-streaming" || t.state === "input-available";
+const isFailedTool = (t: ToolInvocationPart) => t.state === "error" || t.isError === true;
+
+/* ------------------------------------------------------------------ */
+/*  chronological block model                                          */
+/* ------------------------------------------------------------------ */
+
+type AgentBlock =
+  | { kind: "text"; idx: number; part: TextPart }
+  | { kind: "reasoning"; idx: number; part: ReasoningPart }
+  | { kind: "tool"; part: ToolInvocationPart }
+  | { kind: "group"; tools: ToolInvocationPart[] }
+  | { kind: "plan" }
+  | { kind: "question"; part: QuestionPart }
+  | { kind: "approval"; part: ApprovalPart }
+  | { kind: "checkpoint"; part: CheckpointPart }
+  | { kind: "delegation"; part: DelegationPart; idx: number };
+
+/** Walk parts in order, buffering consecutive groupable tool calls into one block. */
+function buildBlocks(parts: MessagePart[]): AgentBlock[] {
+  const blocks: AgentBlock[] = [];
+  let group: ToolInvocationPart[] | null = null;
+  const flush = () => {
+    if (group && group.length > 0) blocks.push({ kind: "group", tools: group });
+    group = null;
+  };
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i];
+    if (p.type === "tool-invocation") {
+      if (GROUPABLE.has(p.toolName)) {
+        if (!group) group = [];
+        group.push(p);
+      } else {
+        flush();
+        blocks.push({ kind: "tool", part: p });
+      }
+      continue;
+    }
+    flush();
+    switch (p.type) {
+      case "text":
+        blocks.push({ kind: "text", idx: i, part: p });
+        break;
+      case "reasoning":
+        blocks.push({ kind: "reasoning", idx: i, part: p });
+        break;
+      case "plan":
+        blocks.push({ kind: "plan" });
+        break;
+      case "question":
+        blocks.push({ kind: "question", part: p });
+        break;
+      case "approval":
+        blocks.push({ kind: "approval", part: p });
+        break;
+      case "checkpoint":
+        blocks.push({ kind: "checkpoint", part: p });
+        break;
+      case "delegation":
+        blocks.push({ kind: "delegation", part: p, idx: i });
+        break;
+      default:
+        break; // diff / file-chip — contribute to chips only, no inline card
+    }
+  }
+  flush();
+  return blocks;
+}
 
 /* ------------------------------------------------------------------ */
 /*  approval card — Allow / Deny via api.respondPermission             */
@@ -172,12 +253,160 @@ function ApprovalCard({ part, projectId }: { part: ApprovalPart; projectId: stri
 }
 
 /* ------------------------------------------------------------------ */
-/*  agent message — full Forge composition order                       */
+/*  thought block — one "Thought for Ns" collapsible per reasoning part */
+/* ------------------------------------------------------------------ */
+
+function ThoughtBlock({ part, live }: { part: ReasoningPart; live: boolean }) {
+  const [open, setOpen] = useState(false);
+  const secs = part.durationMs && part.durationMs > 0 ? Math.max(1, Math.round(part.durationMs / 1000)) : undefined;
+  return (
+    <>
+      <button
+        onClick={() => setOpen(!open)}
+        className="mt-2.5 flex items-center gap-1.5 text-[12px] text-muted transition hover:text-ink"
+      >
+        <ListChecks size={12} /> {live && secs === undefined ? "Thinking…" : `Thought for ${secs ?? 1}s`}
+        {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+      </button>
+      {open && (
+        <div className="anim-fade-in mt-1.5 rounded-lg border border-line-soft bg-cream px-3 py-2">
+          <p className="text-[12px] italic leading-relaxed text-ink-soft">
+            {part.text.length > 0 ? (
+              <>
+                {part.text.slice(0, 600)}
+                {part.text.length > 600 ? "…" : ""}
+              </>
+            ) : (
+              "Reasoning about the request…"
+            )}
+          </p>
+        </div>
+      )}
+    </>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  plan card — collapsed dropdown (in-message + fallback)             */
+/* ------------------------------------------------------------------ */
+
+type TodoLike = { id: string; content: string; status: string };
+
+function PlanCard({ todos }: { todos: TodoLike[] }) {
+  const [open, setOpen] = useState(false);
+  const doneCount = todos.filter((t) => t.status === "completed" || t.status === "done").length;
+  const activeTodo = todos.find((t) => t.status === "in_progress");
+  const allDone = doneCount === todos.length;
+
+  return (
+    <div className="mt-3 overflow-hidden rounded-xl border border-line bg-card">
+      <button onClick={() => setOpen(!open)} className="flex w-full items-center gap-2 px-3 py-2.5 text-left">
+        {allDone ? (
+          <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-full bg-moss text-white">
+            <Check size={11} strokeWidth={3} />
+          </span>
+        ) : (
+          <Loader2 size={15} className="shrink-0 animate-spin text-clay" />
+        )}
+        <span className="min-w-0 flex-1 truncate text-[12.5px] font-semibold">
+          {allDone
+            ? todos[todos.length - 1]?.content ?? "Plan complete"
+            : activeTodo?.content ?? "Working on plan…"}
+        </span>
+        <span className="shrink-0 text-[11px] font-medium tabular-nums text-muted">
+          {doneCount}/{todos.length}
+        </span>
+        {open ? <ChevronDown size={13} className="shrink-0 text-muted" /> : <ChevronRight size={13} className="shrink-0 text-muted" />}
+      </button>
+      {open && (
+        <div className="space-y-1 border-t border-line-soft px-3 py-2">
+          {todos.map((t) => {
+            const done = t.status === "completed" || t.status === "done";
+            const active = t.status === "in_progress";
+            return (
+              <div key={t.id} className="flex items-center gap-2.5 py-1 text-[12.5px]">
+                {done ? (
+                  <span className="flex h-[16px] w-[16px] shrink-0 items-center justify-center rounded-full bg-moss/15 text-moss">
+                    <Check size={10} strokeWidth={3} />
+                  </span>
+                ) : active ? (
+                  <Loader2 size={14} className="shrink-0 animate-spin text-clay" />
+                ) : (
+                  <span className="h-[16px] w-[16px] shrink-0 rounded-full border border-line" />
+                )}
+                <span
+                  className={cn(
+                    "min-w-0 flex-1 truncate",
+                    done ? "text-muted line-through decoration-ink/20" : active ? "font-medium text-ink" : "text-muted",
+                  )}
+                >
+                  {t.content}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  steps group — consecutive read/edit/terminal tool calls, collapsible */
+/* ------------------------------------------------------------------ */
+
+function StepsGroup({ tools, projectId, onOpenFile, onOpenBrowser, autoExpand, terminal, onOpenTerminal }: {
+  tools: ToolInvocationPart[];
+  projectId: string;
+  onOpenFile: (p: string) => void;
+  onOpenBrowser: () => void;
+  autoExpand: boolean;
+  terminal: { command: string; lines: string[] } | null;
+  onOpenTerminal: () => void;
+}) {
+  const [userOpen, setUserOpen] = useState<boolean | null>(null);
+  const busy = tools.some(isBusyTool);
+  const failed = tools.filter(isFailedTool).length;
+  const open = userOpen ?? (autoExpand || busy);
+
+  return (
+    <div className="overflow-hidden rounded-xl border border-line bg-card">
+      <button onClick={() => setUserOpen(!open)} className="flex w-full items-center gap-2 px-3 py-2.5 text-left">
+        {busy ? (
+          <Loader2 size={14} className="shrink-0 animate-spin text-clay" />
+        ) : failed > 0 ? (
+          <span className="h-2 w-2 shrink-0 rounded-full bg-clay" />
+        ) : (
+          <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-full bg-moss text-white">
+            <Check size={11} strokeWidth={3} />
+          </span>
+        )}
+        <span className="shrink-0 text-[12.5px] font-semibold text-ink">Steps</span>
+        <span className="min-w-0 flex-1 truncate text-[11px] font-medium tabular-nums text-muted">
+          {tools.length} {tools.length === 1 ? "step" : "steps"}
+          {failed > 0 ? ` · ${failed} failed` : ""}
+        </span>
+        {open ? <ChevronDown size={13} className="shrink-0 text-muted" /> : <ChevronRight size={13} className="shrink-0 text-muted" />}
+      </button>
+      {open && (
+        <div className="anim-fade-in space-y-1.5 border-t border-line-soft bg-cream/50 px-2.5 py-2.5">
+          {tools.map((t) => (
+            <ToolRow key={t.id} part={t} projectId={projectId} onOpenFile={onOpenFile} onOpenBrowser={onOpenBrowser} />
+          ))}
+          {terminal && (
+            <TerminalReadCard command={terminal.command} lines={terminal.lines} status="running" onOpenTerminal={onOpenTerminal} />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  agent message — strict chronological part flow                     */
 /* ------------------------------------------------------------------ */
 
 function AgentMessage({ msg, isLive, isLast }: { msg: ChatMessage; isLive: boolean; isLast: boolean }) {
-  const [thoughtOpen, setThoughtOpen] = useState(false);
-  const [todosOpen, setTodosOpen] = useState(true);
   const [copied, setCopied] = useState(false);
   const [restoringId, setRestoringId] = useState<string | null>(null);
 
@@ -190,25 +419,25 @@ function AgentMessage({ msg, isLive, isLast }: { msg: ChatMessage; isLive: boole
   const setWsMode = useForge((s) => s.setWsMode);
 
   const parts = msg.parts;
-  const reasoning = parts.filter((p) => p.type === "reasoning");
-  const toolParts = parts.filter((p): p is ToolInvocationPart => p.type === "tool-invocation");
-  const delegations = parts.filter((p) => p.type === "delegation");
-  const planPart = parts.find((p) => p.type === "plan");
+  const planPart = parts.find((p): p is PlanPart => p.type === "plan");
   const checkpointParts = parts.filter((p): p is CheckpointPart => p.type === "checkpoint");
   const questions = parts.filter((p) => p.type === "question");
-  const approvals = parts.filter((p) => p.type === "approval");
   const textParts = parts.filter((p): p is TextPart => p.type === "text");
+  const reasoningParts = parts.filter((p): p is ReasoningPart => p.type === "reasoning");
 
-  const thoughtMs = reasoning.reduce((s, r) => s + (r.durationMs ?? 0), 0);
-  const thoughtSeconds = thoughtMs > 0 ? Math.round(thoughtMs / 1000) : reasoning.length > 0 ? reasoning.length : undefined;
+  // aggregate thinking time for the footer
+  const thoughtMs = reasoningParts.reduce((s, r) => s + (r.durationMs ?? 0), 0);
+  const thoughtSeconds = thoughtMs > 0 ? Math.round(thoughtMs / 1000) : undefined;
 
   const todos = planPart?.todos ?? (isLive ? storeTodos : []);
-  const doneCount = todos.filter((t) => t.status === "completed" || t.status === "done").length;
-  const activeTodo = todos.find((t) => t.status === "in_progress");
 
-  const lastBash = [...toolParts].reverse().find((t) => t.toolName === "Bash");
-  const showTerminalRead =
-    isLive && lastBash !== undefined && (lastBash.state === "running" || lastBash.state === "input-streaming" || lastBash.state === "input-available");
+  const blocks = buildBlocks(parts);
+  let lastGroupIdx = -1;
+  let lastTextIdx = -1;
+  for (let i = 0; i < blocks.length; i++) {
+    if (blocks[i].kind === "group") lastGroupIdx = i;
+    if (blocks[i].kind === "text") lastTextIdx = i;
+  }
 
   const wvErrors: WebViewError[] = webviewErrors.map((e, i) => ({
     id: `wv-${i}`,
@@ -219,7 +448,7 @@ function AgentMessage({ msg, isLive, isLast }: { msg: ChatMessage; isLive: boole
   }));
   const showWvErrors = wvErrors.length > 0 && (isLive || isLast) && !msg.streaming;
 
-  // files touched: file chips + file paths from tool inputs
+  // files touched: file chips + file paths from tool inputs (display relative, open raw)
   const filePaths = new Set<string>();
   for (const p of parts) {
     if (p.type === "file-chip") filePaths.add(p.path);
@@ -229,6 +458,13 @@ function AgentMessage({ msg, isLive, isLast }: { msg: ChatMessage; isLive: boole
       if (typeof fp === "string" && fp) filePaths.add(fp);
     }
   }
+  const shortPath = (f: string) => {
+    const m = f.match(/workspaces\/[a-z0-9]+\/(.+)$/i);
+    if (m) return m[1];
+    const m2 = f.match(/workspace\/(.+)$/);
+    if (m2) return m2[1];
+    return f;
+  };
 
   const copyText = async () => {
     try {
@@ -263,6 +499,10 @@ function AgentMessage({ msg, isLive, isLast }: { msg: ChatMessage; isLive: boole
   const durationS = stats?.durationMs ? Math.max(1, Math.round(stats.durationMs / 1000)) : undefined;
   const hasOpenQuestion = questions.some((q) => !q.answered);
 
+  const terminalLines = consoleEntries.slice(-12).map((c) => c.text.replace(/\n$/, ""));
+  const openFileCb = (p: string) => void openFile(p);
+  const openBrowserCb = () => setWsMode("browser");
+
   return (
     <div className="anim-fade-up px-4 py-4">
       <div className="flex items-center gap-2">
@@ -281,148 +521,91 @@ function AgentMessage({ msg, isLive, isLast }: { msg: ChatMessage; isLive: boole
         <span className="ml-auto text-[11px] text-faint">{timestamp}</span>
       </div>
 
-      {/* thought for Ns */}
-      {thoughtSeconds !== undefined && (
-        <>
-          <button
-            onClick={() => setThoughtOpen(!thoughtOpen)}
-            className="mt-2.5 flex items-center gap-1.5 text-[12px] text-muted transition hover:text-ink"
-          >
-            <ListChecks size={12} /> Thought for {thoughtSeconds}s
-            {thoughtOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-          </button>
-          {thoughtOpen && (
-            <div className="anim-fade-in mt-1.5 space-y-1.5 rounded-lg border border-line-soft bg-cream px-3 py-2">
-              {reasoning.map((r, i) => (
-                <p key={i} className="text-[12px] italic leading-relaxed text-ink-soft">
-                  {r.text.slice(0, 600)}
-                  {r.text.length > 600 ? "…" : ""}
-                </p>
-              ))}
-              {reasoning.length === 0 && <p className="text-[12px] italic text-ink-soft">Reasoning about the request…</p>}
-            </div>
-          )}
-        </>
-      )}
+      {/* fallback plan card — only when the plan never landed as a part (TodoWrite-driven todos) */}
+      {!planPart && todos.length > 0 && <PlanCard todos={todos} />}
 
-      {/* plan / todos card */}
-      {todos.length > 0 && (
-        <div className="mt-3 overflow-hidden rounded-xl border border-line bg-card">
-          <button onClick={() => setTodosOpen(!todosOpen)} className="flex w-full items-center gap-2 px-3 py-2.5 text-left">
-            {doneCount === todos.length ? (
-              <span className="flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded-full bg-moss text-white">
-                <Check size={11} strokeWidth={3} />
-              </span>
-            ) : (
-              <Loader2 size={15} className="shrink-0 animate-spin text-clay" />
-            )}
-            <span className="min-w-0 flex-1 truncate text-[12.5px] font-semibold">
-              {doneCount === todos.length
-                ? todos[todos.length - 1]?.content ?? "Plan complete"
-                : activeTodo?.content ?? "Working on plan…"}
-            </span>
-            <span className="shrink-0 text-[11px] font-medium tabular-nums text-muted">
-              {doneCount}/{todos.length}
-            </span>
-            {todosOpen ? <ChevronDown size={13} className="shrink-0 text-muted" /> : <ChevronRight size={13} className="shrink-0 text-muted" />}
-          </button>
-          {todosOpen && (
-            <div className="space-y-1 border-t border-line-soft px-3 py-2">
-              {todos.map((t) => {
-                const done = t.status === "completed" || t.status === "done";
-                const active = t.status === "in_progress";
-                return (
-                  <div key={t.id} className="flex items-center gap-2.5 py-1 text-[12.5px]">
-                    {done ? (
-                      <span className="flex h-[16px] w-[16px] shrink-0 items-center justify-center rounded-full bg-moss/15 text-moss">
-                        <Check size={10} strokeWidth={3} />
-                      </span>
-                    ) : active ? (
-                      <Loader2 size={14} className="shrink-0 animate-spin text-clay" />
-                    ) : (
-                      <span className="h-[16px] w-[16px] shrink-0 rounded-full border border-line" />
-                    )}
-                    <span
-                      className={cn(
-                        "min-w-0 flex-1 truncate",
-                        done ? "text-muted line-through decoration-ink/20" : active ? "font-medium text-ink" : "text-muted",
-                      )}
-                    >
-                      {t.content}
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
-      )}
+      {/* chronological part flow */}
+      {blocks.map((b, bi) => {
+        switch (b.kind) {
+          case "text":
+            return (
+              <div
+                key={`text-${b.idx}`}
+                className={cn(
+                  "chat-md mt-3 text-[13.5px] leading-[1.65] text-ink",
+                  msg.streaming && bi === lastTextIdx && "stream-caret",
+                )}
+              >
+                {renderMarkdown(b.part.text)}
+              </div>
+            );
+          case "reasoning":
+            return <ThoughtBlock key={`reasoning-${b.idx}`} part={b.part} live={isLive} />;
+          case "tool":
+            return (
+              <div key={`tool-${b.part.id}`} className="mt-2.5">
+                <ToolRow part={b.part} projectId={projectId} onOpenFile={openFileCb} onOpenBrowser={openBrowserCb} />
+              </div>
+            );
+          case "group": {
+            const lastBash = [...b.tools].reverse().find((t) => t.toolName === "Bash");
+            const terminal =
+              isLive && lastBash && isBusyTool(lastBash)
+                ? {
+                    command: (() => {
+                      const input = (lastBash.input ?? {}) as Record<string, unknown>;
+                      return typeof input.command === "string" ? input.command : "…";
+                    })(),
+                    lines: terminalLines,
+                  }
+                : null;
+            return (
+              <div key={`group-${b.tools[0].id}`} className="mt-2.5">
+                <StepsGroup
+                  tools={b.tools}
+                  projectId={projectId}
+                  onOpenFile={openFileCb}
+                  onOpenBrowser={openBrowserCb}
+                  autoExpand={Boolean(msg.streaming && bi === lastGroupIdx)}
+                  terminal={terminal}
+                  onOpenTerminal={() => setWsMode("terminal")}
+                />
+              </div>
+            );
+          }
+          case "plan":
+            return <PlanCard key="plan" todos={todos} />;
+          case "question":
+            return <QuestionCard key={`q-${b.part.requestId}`} part={b.part} projectId={projectId} />;
+          case "approval":
+            return <ApprovalCard key={`a-${b.part.requestId}`} part={b.part} projectId={projectId} />;
+          case "checkpoint":
+            return (
+              <CheckpointCard
+                key={`cp-${b.part.id}`}
+                cp={b.part}
+                onRestore={(c) => void restore(c)}
+                restoring={restoringId === b.part.id}
+                compact
+              />
+            );
+          case "delegation":
+            return <HandoffCard key={`delegation-${b.idx}`} part={b.part} />;
+          default:
+            return null;
+        }
+      })}
 
       {/* swarm */}
       {swarmRun && (isLive || isLast) && <SwarmCard run={swarmRun} />}
-
-      {/* handoffs */}
-      {delegations.map((d, i) => (
-        <HandoffCard key={`${d.agent}-${d.phase}-${i}`} part={d} />
-      ))}
-
-      {/* tool rows */}
-      {toolParts.length > 0 && (
-        <div className="mt-2.5 space-y-1.5">
-          {toolParts.map((t) => (
-            <ToolRow key={t.id} part={t} projectId={projectId} onOpenFile={(p) => void openFile(p)} onOpenBrowser={() => setWsMode("browser")} />
-          ))}
-        </div>
-      )}
-
-      {/* terminal read (live bash tail) */}
-      {showTerminalRead && lastBash && (
-        <TerminalReadCard
-          command={(() => {
-            const input = (lastBash.input ?? {}) as Record<string, unknown>;
-            return typeof input.command === "string" ? input.command : "…";
-          })()}
-          lines={consoleEntries.slice(-12).map((c) => c.text.replace(/\n$/, ""))}
-          status="running"
-          onOpenTerminal={() => setWsMode("terminal")}
-        />
-      )}
 
       {/* webview errors */}
       {showWvErrors && (
         <WebViewErrorCard errors={wvErrors} onFix={() => setWsMode("console")} onOpenConsole={() => setWsMode("console")} />
       )}
 
-      {/* checkpoints in the message */}
-      {checkpointParts.map((cp) => (
-        <CheckpointCard key={cp.id} cp={cp} onRestore={(c) => void restore(c)} restoring={restoringId === cp.id} compact />
-      ))}
-
       {/* artifact cards (real files, most recent few on the last message) */}
       {isLast && !msg.streaming && <RecentArtifacts />}
-
-      {/* questions */}
-      {questions.map((q) => (
-        <QuestionCard key={q.requestId} part={q} projectId={projectId} />
-      ))}
-
-      {/* approvals */}
-      {approvals.map((a) => (
-        <ApprovalCard key={a.requestId} part={a} projectId={projectId} />
-      ))}
-
-      {/* markdown text — stream caret on the last text part */}
-      {textParts.map((t, i) => (
-        <div
-          key={i}
-          className={cn(
-            "chat-md mt-3 text-[13.5px] leading-[1.65] text-ink",
-            msg.streaming && i === textParts.length - 1 && "stream-caret",
-          )}
-        >
-          {renderMarkdown(t.text)}
-        </div>
-      ))}
 
       {/* files touched */}
       {filePaths.size > 0 && !msg.streaming && (
@@ -433,7 +616,7 @@ function AgentMessage({ msg, isLive, isLast }: { msg: ChatMessage; isLive: boole
               onClick={() => void openFile(f)}
               className="flex items-center gap-1.5 rounded-lg border border-line bg-card px-2 py-1 font-mono text-[11px] text-ink-soft transition hover:border-ink/25 hover:text-ink"
             >
-              <FilePenLine size={11} className="text-moss" /> {f}
+              <FilePenLine size={11} className="shrink-0 text-moss" /> {shortPath(f)}
             </button>
           ))}
         </div>
@@ -519,6 +702,34 @@ function UserMessage({ msg }: { msg: ChatMessage }) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  header popover rows                                                */
+/* ------------------------------------------------------------------ */
+
+function HistoryRow({ cp, restoring, onRestore }: { cp: CheckpointDTO; restoring: boolean; onRestore: () => void }) {
+  return (
+    <div className="flex items-center gap-2 rounded-lg px-2 py-1.5 transition hover:bg-black/[0.04]">
+      <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-black/[0.06] text-ink-soft">
+        <Bookmark size={11} />
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate text-[12px] font-medium text-ink">{cp.label}</span>
+        <span className="block truncate text-[10px] text-faint">
+          {relTime(cp.createdAt)}
+          {cp.commitHash ? ` · ${cp.commitHash.slice(0, 7)}` : ""}
+        </span>
+      </span>
+      <button
+        onClick={onRestore}
+        disabled={restoring}
+        className="flex h-6 shrink-0 items-center gap-1 rounded-md border border-line bg-card px-2 text-[10px] font-semibold text-ink-soft transition hover:border-ink/25 hover:text-ink disabled:opacity-50"
+      >
+        {restoring ? <Loader2 size={10} className="animate-spin" /> : <RotateCcw size={10} />} Restore
+      </button>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /*  chat panel                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -533,6 +744,9 @@ export default function ChatPanel() {
   const activeProject = useForge((s) => s.activeProject);
   const picks = useForge((s) => s.picks);
   const checkpoints = useForge((s) => s.checkpoints);
+  const versions = useForge((s) => s.versions);
+  const sessions = useForge((s) => s.sessions);
+  const activeSessionId = useForge((s) => s.activeSessionId);
   const contextUsed = useForge((s) => s.contextUsed);
   const contextWindow = useForge((s) => s.contextWindow);
   const send = useForge((s) => s.send);
@@ -540,13 +754,20 @@ export default function ChatPanel() {
   const removePick = useForge((s) => s.removePick);
   const setOverlay = useForge((s) => s.setOverlay);
   const contextPanelOpen = useForge((s) => s.contextPanelOpen);
+  const newTask = useForge((s) => s.newTask);
+  const switchSession = useForge((s) => s.switchSession);
 
   const [draft, setDraft] = useState("");
-  const [planOpen, setPlanOpen] = useState(true);
+  const [planOpen, setPlanOpen] = useState(false);
+  const [headerMenu, setHeaderMenu] = useState<null | "sessions" | "history">(null);
+  const [restoringCp, setRestoringCp] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const areaRef = useRef<HTMLTextAreaElement>(null);
   const plusBtnRef = useRef<HTMLButtonElement>(null);
   const attachRef = useRef<HTMLDivElement>(null);
+
+  const activeSession = sessions.find((s) => s.id === activeSessionId) ?? null;
+  const sessionTitle = activeSession?.title ?? activeProject?.title ?? "New task";
 
   // auto-scroll to bottom
   useEffect(() => {
@@ -596,6 +817,25 @@ export default function ChatPanel() {
     setDraft("");
   };
 
+  const restoreCp = async (cp: CheckpointDTO) => {
+    const projectId = activeProject?.id;
+    if (!projectId || restoringCp) return;
+    setRestoringCp(cp.id);
+    try {
+      await api.gitRestore(projectId, cp.id);
+      const s = useForge.getState();
+      s.toast({ title: "Version restored", description: cp.label, variant: "success" });
+      void s.refreshGit();
+      void s.refreshFileTree();
+      void s.refreshArtifacts();
+      s.bumpPreview();
+    } catch (e) {
+      useForge.getState().toast({ title: "Restore failed", description: String(e), variant: "error" });
+    } finally {
+      setRestoringCp(null);
+    }
+  };
+
   const pendingQuestion = [...messages]
     .reverse()
     .find((m) => m.parts.some((p) => p.type === "question" && !p.answered));
@@ -608,35 +848,88 @@ export default function ChatPanel() {
 
   return (
     <div className="flex h-full w-full flex-col bg-paper">
-      {/* header — single thread per project */}
+      {/* header — session switcher · history · task settings */}
       <div className="flex h-[52px] shrink-0 items-center gap-1.5 border-b border-line px-2.5">
         <div className="relative min-w-0 flex-1">
-          <div className="flex min-w-0 items-center gap-2 rounded-lg px-2 py-1.5">
-            <MessageSquarePlus size={14} className="shrink-0 text-clay" />
+          <button
+            onClick={() => setHeaderMenu(headerMenu === "sessions" ? null : "sessions")}
+            title="Switch task"
+            className="flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-left transition hover:bg-black/[0.04]"
+          >
+            <ChevronDown size={13} className={cn("shrink-0 text-muted transition", headerMenu === "sessions" && "rotate-180")} />
             <span className="min-w-0 flex-1">
-              <span className="block truncate text-[13px] font-semibold leading-tight">{activeProject?.title ?? "New task"}</span>
+              <span className="block truncate text-[13px] font-semibold leading-tight">{sessionTitle}</span>
               <span className="block truncate text-[10.5px] leading-tight text-muted">
                 <ConfigSummary /> · {messages.length} msgs
               </span>
             </span>
-          </div>
-        </div>
+          </button>
 
-        <button
-          onClick={() => {
-            setDraft("");
-            areaRef.current?.focus();
-          }}
-          title="New task"
-          className="flex h-8 shrink-0 items-center gap-1.5 rounded-lg border border-line bg-card px-2.5 text-[11.5px] font-semibold text-ink-soft transition hover:border-ink/25 hover:text-ink"
-        >
-          <Plus size={13} /> New task
-        </button>
+          {/* session switcher dropdown */}
+          {headerMenu === "sessions" && (
+            <>
+              <div className="fixed inset-0 z-[80]" onClick={() => setHeaderMenu(null)} />
+              <div className="anim-fade-up absolute left-0 top-full z-[90] mt-1 w-[300px] max-w-[calc(100vw-24px)] overflow-hidden rounded-xl border border-line bg-card shadow-2xl">
+                <button
+                  onClick={() => {
+                    setHeaderMenu(null);
+                    void newTask();
+                  }}
+                  className="flex w-full items-center gap-2 border-b border-line-soft px-3 py-2.5 text-left transition hover:bg-black/[0.04]"
+                >
+                  <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-ink text-paper">
+                    <Plus size={13} />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-[12.5px] font-semibold">New task</span>
+                    <span className="block text-[10px] text-muted">a fresh conversation, same project</span>
+                  </span>
+                </button>
+                <div className="max-h-[280px] overflow-y-auto p-1.5">
+                  {sessions.length === 0 && (
+                    <p className="px-2 py-3 text-center text-[11.5px] text-muted">No previous tasks yet.</p>
+                  )}
+                  {sessions.map((s) => {
+                    const active = s.id === activeSessionId;
+                    return (
+                      <button
+                        key={s.id}
+                        disabled={active}
+                        onClick={() => {
+                          setHeaderMenu(null);
+                          void switchSession(s.id);
+                        }}
+                        className={cn(
+                          "flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left transition disabled:cursor-default",
+                          active ? "bg-ink/[0.05]" : "hover:bg-black/[0.04]",
+                        )}
+                      >
+                        <MessageSquarePlus size={13} className={cn("shrink-0", active ? "text-moss" : "text-faint")} />
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-[12.5px] font-medium text-ink">{s.title || "Untitled task"}</span>
+                          <span className="block text-[10px] text-faint">{relTime(s.updatedAt)}</span>
+                        </span>
+                        <span className="shrink-0 text-[10px] tabular-nums text-faint">
+                          {s.messageCount} msg{s.messageCount === 1 ? "" : "s"}
+                        </span>
+                        {active && (
+                          <span className="shrink-0 rounded-full bg-moss/15 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide text-moss">
+                            active
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </>
+          )}
+        </div>
 
         <div className="relative shrink-0">
           <button
-            onClick={() => setOverlay("versionsOpen", true)}
-            title="Checkpoints"
+            onClick={() => setHeaderMenu(headerMenu === "history" ? null : "history")}
+            title="Checkpoints & versions"
             className="relative flex h-8 w-8 items-center justify-center rounded-lg text-muted transition hover:bg-black/5 hover:text-ink"
           >
             <History size={15} />
@@ -646,6 +939,39 @@ export default function ChatPanel() {
               </span>
             )}
           </button>
+
+          {/* history dropdown — this task + project versions */}
+          {headerMenu === "history" && (
+            <>
+              <div className="fixed inset-0 z-[80]" onClick={() => setHeaderMenu(null)} />
+              <div className="anim-fade-up absolute right-0 top-full z-[90] mt-1 w-[320px] max-w-[calc(100vw-24px)] overflow-hidden rounded-xl border border-line bg-card shadow-2xl">
+                <p className="border-b border-line-soft bg-cream px-3 py-2 text-[10px] font-bold uppercase tracking-wider text-muted">
+                  This task
+                </p>
+                <div className="max-h-[170px] overflow-y-auto p-1.5">
+                  {checkpoints.length === 0 ? (
+                    <p className="px-2 py-3 text-center text-[11.5px] text-muted">No checkpoints in this task yet.</p>
+                  ) : (
+                    checkpoints.map((cp) => (
+                      <HistoryRow key={cp.id} cp={cp} restoring={restoringCp === cp.id} onRestore={() => void restoreCp(cp)} />
+                    ))
+                  )}
+                </div>
+                <p className="border-y border-line-soft bg-cream px-3 py-2 text-[10px] font-bold uppercase tracking-wider text-muted">
+                  Project versions
+                </p>
+                <div className="max-h-[170px] overflow-y-auto p-1.5">
+                  {versions.length === 0 ? (
+                    <p className="px-2 py-3 text-center text-[11.5px] text-muted">No project versions yet — milestones land here automatically.</p>
+                  ) : (
+                    versions.map((cp) => (
+                      <HistoryRow key={cp.id} cp={cp} restoring={restoringCp === cp.id} onRestore={() => void restoreCp(cp)} />
+                    ))
+                  )}
+                </div>
+              </div>
+            </>
+          )}
         </div>
 
         <button
@@ -733,7 +1059,7 @@ export default function ChatPanel() {
         </div>
       )}
 
-      {/* task plan mini-card */}
+      {/* task plan mini-card — collapsed dropdown above the composer */}
       {todos.length > 0 && (
         <div className="shrink-0 px-3 pb-2">
           <div className="overflow-hidden rounded-xl border border-line bg-card">
@@ -824,7 +1150,7 @@ export default function ChatPanel() {
             }}
             placeholder={
               hasPendingQuestion
-                ? "Or type a custom answer for Forge's question…"
+                ? "Forge is waiting for your answer above…"
                 : isWorking
                   ? "Agent is working… (stop to interrupt)"
                   : "Ask Forge to build, edit, or explain…"

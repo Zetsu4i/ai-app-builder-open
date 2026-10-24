@@ -145,13 +145,36 @@ export default function PreviewPane() {
 
   const reload = () => setLocalKey((k) => k + 1);
 
+  /** If the frame landed on the "warming up" placeholder, remount until real content shows. */
+  const warmupRetries = useRef(0);
+  const warmupTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const scheduleWarmupRetry = () => {
+    if (warmupRetries.current >= 8) return;
+    warmupRetries.current += 1;
+    if (warmupTimer.current) clearTimeout(warmupTimer.current);
+    warmupTimer.current = setTimeout(() => setLocalKey((k) => k + 1), 2500 * warmupRetries.current);
+  };
+
   const onFrameLoad = () => {
     handshake();
-    if (useCloud) return;
+    if (useCloud) {
+      scheduleWarmupRetry();
+      return;
+    }
     try {
+      const doc = frameRef.current?.contentDocument;
+      // stale "warming up" / error placeholder → remount the frame shortly
+      if (doc?.body?.textContent?.includes("Preview warming up")) {
+        scheduleWarmupRetry();
+        return;
+      }
+      warmupRetries.current = 0;
       const loc = frameRef.current?.contentWindow?.location;
       if (loc && loc.pathname.startsWith("/api/bff/")) {
         const rest = loc.pathname.slice(base.length - 1); // keep leading slash
+        setPath(rest + loc.search);
+      } else if (loc && loc.pathname.startsWith(`/preview/${projectId}`)) {
+        const rest = loc.pathname.slice((`/preview/${projectId}`).length) || "/";
         setPath(rest + loc.search);
       }
     } catch {

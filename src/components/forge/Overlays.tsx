@@ -42,6 +42,7 @@ import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
 import { useForge, type Toast } from "@/lib/store";
 import type { FileNode } from "@/lib/types";
+import { SettingsSheet } from "./ComposerSettings";
 
 /* ---------------- Command palette ---------------- */
 
@@ -619,6 +620,40 @@ function NewFileBody() {
   );
 }
 
+/* ---------------- Task settings sheet ---------------- */
+
+/** Right-side sheet that hosts the composer SettingsSheet (framework, design system, style, agent mode, swarm). */
+export function SettingsSheetModal() {
+  const open = useForge((s) => s.settingsSheetOpen);
+  const setOverlay = useForge((s) => s.setOverlay);
+  if (!open) return null;
+  const onClose = () => setOverlay("settingsSheetOpen", false);
+  return (
+    <div className="fixed inset-0 z-[100] bg-ink/20 backdrop-blur-[1px]" onClick={onClose}>
+      <div
+        className="anim-slide-right absolute right-0 top-0 flex h-full w-[340px] max-w-[92vw] flex-col border-l border-line bg-card shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex shrink-0 items-center gap-2.5 border-b border-line-soft px-4 py-3.5">
+          <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-ink text-white">
+            <Settings size={15} />
+          </span>
+          <div className="min-w-0 flex-1">
+            <p className="text-[14px] font-bold">Task settings</p>
+            <p className="text-[11px] text-muted">Applies to the next agent turn</p>
+          </div>
+          <button onClick={onClose} className="flex h-7 w-7 items-center justify-center rounded-lg text-muted transition hover:bg-black/5 hover:text-ink">
+            <X size={15} />
+          </button>
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
+          <SettingsSheet />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ---------------- Toasts ---------------- */
 
 export function ToastStack() {
@@ -660,6 +695,7 @@ export default function Overlays() {
       <PublishModal />
       <ShareModal />
       <NewFileModal />
+      <SettingsSheetModal />
       <ToastStack />
     </>
   );

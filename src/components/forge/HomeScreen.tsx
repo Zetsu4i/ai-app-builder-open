@@ -8,13 +8,14 @@ import { createPortal } from "react-dom";
 import {
   ArrowUp, Plus, FolderGit2, Wand2, Mic, ChevronRight, ArrowUpRight,
   Check, Globe, Smartphone, Palette, Sparkles, Presentation, FileText,
-  MousePointerClick, BarChart3, Boxes, Loader2, Settings2, Users,
+  MousePointerClick, BarChart3, Boxes, Loader2, Settings2, Users, Binary,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useForge } from "@/lib/store";
 import * as api from "@/lib/api";
 import type { ModeDTO } from "@/lib/types";
+import { ComposerConfigPanel } from "./ComposerSettings";
 
 /* ---------------- modes ---------------- */
 
@@ -27,6 +28,7 @@ const MODE_ICONS: Record<string, LucideIcon> = {
   document: FileText,
   computer: MousePointerClick,
   data: BarChart3,
+  reverse: Binary,
 };
 
 const FALLBACK_MODES: ModeDTO[] = [
@@ -38,6 +40,7 @@ const FALLBACK_MODES: ModeDTO[] = [
   { slug: "document", name: "Document", icon: "file-text", color: "#5b6b4c", description: "Reports and structured docs", frameworks: ["markdown"], samplePrompts: [], swarmAllowed: true, isBuiltin: true },
   { slug: "computer", name: "Computer", icon: "mouse-pointer-click", color: "#b4532a", description: "Drive a real browser / desktop", frameworks: ["agent"], samplePrompts: [], swarmAllowed: true, isBuiltin: true },
   { slug: "data", name: "Data", icon: "bar-chart-3", color: "#1d7a3a", description: "Pipelines, analysis, charts", frameworks: ["python"], samplePrompts: [], swarmAllowed: true, isBuiltin: true },
+  { slug: "reverse", name: "Reverse Engineering", icon: "binary", color: "#3f3f46", description: "Binary & protocol analysis with REA tooling", frameworks: ["python"], samplePrompts: [], swarmAllowed: true, isBuiltin: true },
 ];
 
 /* ---------------- sample prompts per mode (3 each) ---------------- */
@@ -82,6 +85,11 @@ const SAMPLES: Record<string, string[]> = {
     "Analyze this sales CSV and build a revenue dashboard with cohort retention",
     "Scrape product listings, clean the data and chart price distribution",
     "Build a KPI report from the analytics export with week-over-week deltas",
+  ],
+  reverse: [
+    "Analyze the binary in samples/, map entry point and key functions, document control flow",
+    "Extract embedded strings, flags and configs from this executable and write an IOC report",
+    "Reverse this protocol capture and build a python parser",
   ],
 };
 
@@ -132,8 +140,11 @@ export default function HomeScreen() {
   const [modes, setModes] = useState<ModeDTO[]>(FALLBACK_MODES);
   const [modeOpen, setModeOpen] = useState(false);
   const [enhancing, setEnhancing] = useState(false);
+  const [configOpen, setConfigOpen] = useState(false);
   const modeBtnRef = useRef<HTMLButtonElement>(null);
   const modeRef = useRef<HTMLDivElement>(null);
+  const composerCardRef = useRef<HTMLDivElement>(null);
+  const configWrapRef = useRef<HTMLDivElement>(null);
 
   // load modes (builtin + custom) from the backend
   useEffect(() => {
@@ -188,6 +199,38 @@ export default function HomeScreen() {
       window.removeEventListener("scroll", place, true);
     };
   }, [modeOpen]);
+
+  /* ---------- task-setup panel placement (anchored under the composer card) ---------- */
+
+  useEffect(() => {
+    if (!configOpen) return;
+    const place = () => {
+      const card = composerCardRef.current;
+      const wrap = configWrapRef.current;
+      if (!card || !wrap) return;
+      const panel = wrap.firstElementChild as HTMLElement | null;
+      if (!panel) return;
+      const r = card.getBoundingClientRect();
+      const w = panel.offsetWidth || 340;
+      const maxH = Math.max(280, Math.min(window.innerHeight * 0.7, window.innerHeight - r.bottom - 20));
+      panel.style.maxHeight = `${maxH}px`;
+      wrap.style.visibility = "visible";
+      wrap.style.top = `${r.bottom + 8}px`;
+      let left = r.right - w;
+      if (left < 8) left = 8;
+      if (left + w > window.innerWidth - 8) left = window.innerWidth - w - 8;
+      wrap.style.left = `${left}px`;
+    };
+    place();
+    const id = window.setTimeout(place, 16);
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      window.clearTimeout(id);
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [configOpen]);
 
   /* ---------- actions ---------- */
 
@@ -245,6 +288,7 @@ export default function HomeScreen() {
 
         {/* composer */}
         <div
+          ref={composerCardRef}
           className={cn(
             "anim-fade-up stagger-2 relative mt-7 rounded-2xl border bg-card shadow-[0_16px_48px_-20px_rgba(28,25,23,0.3)] transition",
             modeOpen ? "border-ink/30" : "border-line",
@@ -283,14 +327,14 @@ export default function HomeScreen() {
               </span>
             )}
             <button
-              onClick={() => setOverlay("contextPanelOpen", true)}
+              onClick={() => setConfigOpen(true)}
               className="flex items-center gap-1 rounded-md bg-sage-bg px-2 py-1 text-[10px] font-semibold text-moss transition hover:bg-moss/15"
               title="Edit skills & MCPs"
             >
               Skills {composer.skills.length}
             </button>
             <button
-              onClick={() => setOverlay("contextPanelOpen", true)}
+              onClick={() => setConfigOpen(true)}
               className="flex items-center gap-1 rounded-md bg-sage-bg px-2 py-1 text-[10px] font-semibold text-moss transition hover:bg-moss/15"
               title="Edit skills & MCPs"
             >
@@ -305,7 +349,7 @@ export default function HomeScreen() {
               </span>
             )}
             <button
-              onClick={() => setOverlay("settingsSheetOpen", true)}
+              onClick={() => setConfigOpen(true)}
               className="ml-auto flex items-center gap-1 text-[10px] font-semibold text-muted transition hover:text-ink"
             >
               <Settings2 size={10} /> Edit
@@ -315,9 +359,9 @@ export default function HomeScreen() {
           {/* toolbar */}
           <div className="flex items-center gap-1.5 px-3 pb-3">
             <button
-              onClick={() => setOverlay("contextPanelOpen", true)}
+              onClick={() => setConfigOpen(true)}
               className="flex h-8 w-8 items-center justify-center rounded-lg border border-line text-muted transition hover:border-ink/25 hover:text-ink"
-              title="Add context — skills and MCPs"
+              title="Add context — task setup, skills and MCPs"
             >
               <Plus size={16} />
             </button>
@@ -440,6 +484,22 @@ export default function HomeScreen() {
             </div>
           </div>
         </div>
+
+        {/* task-setup panel — opens from the + / Edit / Skills / MCPs buttons */}
+        {configOpen &&
+          createPortal(
+            <>
+              <div className="fixed inset-0 z-[90]" onClick={() => setConfigOpen(false)} />
+              <div
+                ref={configWrapRef}
+                style={{ visibility: "hidden" }}
+                className="anim-fade-up fixed z-[100]"
+              >
+                <ComposerConfigPanel onClose={() => setConfigOpen(false)} />
+              </div>
+            </>,
+            document.body,
+          )}
 
         {/* samples */}
         <p className="mt-7 text-[13px] font-semibold">

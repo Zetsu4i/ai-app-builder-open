@@ -312,15 +312,33 @@ export interface UsageDTO {
 
 export interface HydratePayload {
   project: ProjectDTO;
+  sessionId: string | null;
+  sessions: SessionDTO[];
   messages: ChatMessage[];
   events: AgentEvent[];
   artifacts: ArtifactDTO[];
   checkpoints: CheckpointDTO[];
+  /** project-wide major checkpoints (Version history) */
+  versions: CheckpointDTO[];
+  /** live turn state — lets a reload re-attach to a still-working agent */
+  turn: { active: boolean; liveId: string | null; parts: MessagePart[]; startedAt: number | null };
+  /** unresolved permission / question waiting on the user */
+  pending: ({ type: "permission" | "question" } & Record<string, unknown>) | null;
   fileTree: FileNode[];
   sandbox: SandboxState;
   devServer: DevServerState;
   swarmRun: SwarmRunDTO | null;
   usage: { contextUsed: number; contextWindow: number; totalTokens: number } | null;
+}
+
+// ---------- chat sessions ("tasks" on one project) ----------
+export interface SessionDTO {
+  id: string;
+  title: string;
+  isActive: boolean;
+  messageCount: number;
+  createdAt: string;
+  updatedAt: string;
 }
 
 // ---------- Composer ----------

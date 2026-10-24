@@ -19,6 +19,7 @@ import type {
   MessagePart,
   PickedElement,
   ProjectDTO,
+  SessionDTO,
   SwarmRunDTO,
   ToolInvocationPart,
 } from "./types";
@@ -85,7 +86,14 @@ export function mergeToolPart(parts: MessagePart[], incoming: MessagePart): Mess
     return [...parts, { ...incoming }];
   }
   if (incoming.type === "plan") {
-    return [...parts.filter((p) => p.type !== "plan"), incoming];
+    // replace IN PLACE so the plan card never jumps around while streaming
+    const idx = parts.findIndex((p) => p.type === "plan");
+    if (idx >= 0) {
+      const next = [...parts];
+      next[idx] = incoming;
+      return next;
+    }
+    return [...parts, incoming];
   }
   if (incoming.type === "approval" || incoming.type === "question") {
     const key = incoming.type === "approval" ? "requestId" : "requestId";
@@ -125,6 +133,11 @@ interface ForgeState {
   // projects
   projects: ProjectDTO[];
   activeProject: ProjectDTO | null;
+
+  // chat sessions ("tasks" on the active project)
+  sessions: SessionDTO[];
+  activeSessionId: string | null;
+  versions: CheckpointDTO[];
 
   // chat
   messages: ChatMessage[];
@@ -189,6 +202,11 @@ interface ForgeState {
   createAndOpen: (body: Parameters<typeof api.createProject>[0]) => Promise<void>;
   patchProject: (patch: Partial<ProjectDTO>) => Promise<void>;
 
+  // chat sessions
+  loadSessions: () => Promise<void>;
+  newTask: () => Promise<void>;
+  switchSession: (sessionId: string) => Promise<void>;
+
   send: (content: string) => Promise<void>;
   stop: () => Promise<void>;
   retry: () => Promise<void>;
@@ -200,6 +218,7 @@ interface ForgeState {
   refreshGit: () => Promise<void>;
   refreshArtifacts: () => Promise<void>;
   refreshSwarm: () => Promise<void>;
+  refreshDevServer: () => Promise<void>;
   bumpPreview: () => void;
   addConsole: (e: Omit<ConsoleEntry, "id" | "createdAt">) => void;
   addPick: (p: PickedElement) => void;
@@ -226,6 +245,10 @@ export const useForge = create<ForgeState>((set, get) => ({
   projects: [],
   activeProject: null,
 
+  sessions: [],
+  activeSessionId: null,
+  versions: [],
+
   messages: [],
   liveMessageId: null,
   isWorking: false,
@@ -246,7 +269,7 @@ export const useForge = create<ForgeState>((set, get) => ({
     mcps: [],
     swarm: false,
     swarmAgents: 3,
-    agentMode: "build",
+    agentMode: "yolo",
   },
 
   wsMode: "preview",
@@ -298,9 +321,57 @@ export const useForge = create<ForgeState>((set, get) => ({
   openProject: async (id) => {
     try {
       const data: HydratePayload = await api.hydrateProject(id);
+      if (typeof window !== "undefined") localStorage.setItem("forge.lastProject", id);
+      const composer = get().composer;
+      const msgs: ChatMessage[] = [...data.messages];
+      let liveId: string | null = null;
+      let working = false;
+      // re-attach to a turn that is STILL running server-side (reload / leave-chat case)
+      if (data.turn?.active && data.turn.liveId) {
+        liveId = data.turn.liveId;
+        working = true;
+        msgs.push({
+          id: data.turn.liveId,
+          role: "assistant",
+          parts: data.turn.parts ?? [],
+          createdAt: data.turn.startedAt ? new Date(data.turn.startedAt).toISOString() : new Date().toISOString(),
+          streaming: true,
+        });
+        // unresolved permission/question from before the reload
+        const pending = data.pending;
+        if (pending && (pending.type === "permission" || pending.type === "question")) {
+          const part: MessagePart =
+            pending.type === "permission"
+              ? {
+                  type: "approval",
+                  requestId: String(pending.requestId ?? ""),
+                  toolName: String(pending.toolName ?? "tool"),
+                  input: pending.input,
+                  riskLevel: pending.riskLevel ? String(pending.riskLevel) : undefined,
+                  reason: pending.reason ? String(pending.reason) : undefined,
+                }
+              : {
+                  type: "question",
+                  requestId: String(pending.requestId ?? ""),
+                  prompt: pending.prompt ? String(pending.prompt) : undefined,
+                  questions: Array.isArray(pending.questions)
+                    ? (pending.questions as { id?: string; question?: string; options?: { value?: string }[] }[]).map((q) => ({
+                        id: String(q.id ?? Math.random().toString(36).slice(2)),
+                        question: String(q.question ?? ""),
+                        options: (q.options ?? []).map((o) => ({ value: String(o.value ?? ""), label: String(o.value ?? "") })),
+                      }))
+                    : [],
+                };
+          const liveIdx = msgs.findIndex((m) => m.id === liveId);
+          if (liveIdx >= 0) msgs[liveIdx] = { ...msgs[liveIdx], parts: mergeToolPart(msgs[liveIdx].parts, part) };
+        }
+      }
       set({
         activeProject: data.project,
-        messages: data.messages,
+        sessions: data.sessions ?? [],
+        activeSessionId: data.sessionId ?? null,
+        versions: data.versions ?? [],
+        messages: msgs,
         artifacts: data.artifacts,
         checkpoints: data.checkpoints,
         fileTree: data.fileTree,
@@ -311,8 +382,8 @@ export const useForge = create<ForgeState>((set, get) => ({
         contextWindow: data.usage?.contextWindow ?? 200000,
         totalTokens: data.usage?.totalTokens ?? 0,
         view: "workspace",
-        isWorking: false,
-        liveMessageId: null,
+        isWorking: working,
+        liveMessageId: liveId,
         lastError: null,
         openTabs: [],
         activePath: null,
@@ -321,26 +392,108 @@ export const useForge = create<ForgeState>((set, get) => ({
         previewKey: 0,
         wsMode: data.project.mode === "design" ? "preview" : "preview",
         composer: {
-          ...get().composer,
+          ...composer,
           mode: data.project.mode,
           framework: data.project.framework,
           swarm: data.project.swarmEnabled,
-          agentMode: (data.project.agentMode as ComposerConfig["agentMode"]) || "build",
+          agentMode: (data.project.agentMode as ComposerConfig["agentMode"]) || "yolo",
           designSystem: (data.project.modeConfig as { designSystem?: string })?.designSystem ?? null,
           style: (data.project.modeConfig as { style?: string })?.style ?? null,
         },
       });
       joinProject(id);
       void get().refreshGit();
+      if (working) void get().loadSessions();
+      // pick up the auto-started dev server (events can precede the room join)
+      for (const delay of [2000, 6000, 12000]) {
+        window.setTimeout(() => {
+          const cur = get().activeProject;
+          if (cur?.id === id && get().devServer.status === "stopped") void get().refreshDevServer();
+        }, delay);
+      }
     } catch (e) {
       get().toast({ title: "Failed to open project", description: String(e), variant: "error" });
+    }
+  },
+
+  // ---------- chat sessions ----------
+  loadSessions: async () => {
+    const p = get().activeProject;
+    if (!p) return;
+    try {
+      const { sessions } = await api.listSessions(p.id);
+      set({ sessions });
+    } catch {
+      /* noop */
+    }
+  },
+
+  newTask: async () => {
+    const p = get().activeProject;
+    if (!p) return;
+    try {
+      const { session } = await api.createSession(p.id);
+      set({
+        sessions: [...get().sessions.map((s) => ({ ...s, isActive: false })), session],
+        activeSessionId: session.id,
+        messages: [],
+        liveMessageId: null,
+        isWorking: false,
+        agentActivity: null,
+        lastError: null,
+        todos: [],
+      });
+      get().toast({ title: "New task started", description: "Same project — a fresh conversation so old context stays intact." });
+      void get().loadSessions();
+    } catch (e) {
+      get().toast({ title: "Failed to start a new task", description: String(e), variant: "error" });
+    }
+  },
+
+  switchSession: async (sessionId) => {
+    const p = get().activeProject;
+    if (!p || sessionId === get().activeSessionId) return;
+    try {
+      await api.activateSession(p.id, sessionId);
+      const data: HydratePayload = await api.hydrateProject(p.id, sessionId);
+      set({
+        activeSessionId: sessionId,
+        messages: data.messages,
+        liveMessageId: null,
+        isWorking: false,
+        agentActivity: null,
+        lastError: null,
+        todos: [],
+        checkpoints: data.checkpoints,
+        versions: data.versions ?? get().versions,
+        sessions: get().sessions.map((s) => ({ ...s, isActive: s.id === sessionId })),
+      });
+      get().toast({ title: "Switched task", description: data.sessions.find((s) => s.id === sessionId)?.title ?? sessionId.slice(0, 8) });
+      void get().loadSessions();
+    } catch (e) {
+      get().toast({ title: "Failed to switch task", description: String(e), variant: "error" });
     }
   },
 
   closeProject: () => {
     const p = get().activeProject;
     if (p) leaveProject(p.id);
-    set({ activeProject: null, messages: [], view: "home", swarmRun: null, artifacts: [], openTabs: [], activePath: null });
+    if (typeof window !== "undefined") localStorage.removeItem("forge.lastProject");
+    set({
+      activeProject: null,
+      messages: [],
+      view: "home",
+      swarmRun: null,
+      artifacts: [],
+      openTabs: [],
+      activePath: null,
+      sessions: [],
+      activeSessionId: null,
+      versions: [],
+      todos: [],
+      consoleEntries: [],
+      webviewErrors: [],
+    });
   },
 
   createAndOpen: async (body) => {
@@ -463,8 +616,13 @@ export const useForge = create<ForgeState>((set, get) => ({
     const p = get().activeProject;
     if (!p) return;
     try {
-      const [status, log, cps] = await Promise.all([api.gitStatus(p.id), api.gitLog(p.id), api.listCheckpoints(p.id)]);
-      set({ gitStatus: status, gitLog: log.log, checkpoints: cps.checkpoints });
+      const [status, log, cps, versions] = await Promise.all([
+        api.gitStatus(p.id),
+        api.gitLog(p.id),
+        api.listCheckpoints(p.id),
+        api.listVersions(p.id).catch(() => ({ versions: get().versions })),
+      ]);
+      set({ gitStatus: status, gitLog: log.log, checkpoints: cps.checkpoints, versions: versions.versions });
     } catch {
       /* noop */
     }
@@ -492,6 +650,21 @@ export const useForge = create<ForgeState>((set, get) => ({
     }
   },
 
+  // the backend auto-boots the dev server around hydrate/turn-end; its events may
+  // fire before the socket joins the room — poll the state explicitly instead.
+  refreshDevServer: async () => {
+    const p = get().activeProject;
+    if (!p) return;
+    try {
+      const dev = await api.getDevServer(p.id);
+      const wasStopped = get().devServer.status === "stopped" || get().devServer.status === "starting";
+      set({ devServer: { ...get().devServer, ...dev } });
+      if (dev.status === "ready" && wasStopped) get().bumpPreview();
+    } catch {
+      /* noop */
+    }
+  },
+
   bumpPreview: () => set({ previewKey: get().previewKey + 1 }),
   addConsole: (e) =>
     set({
@@ -506,6 +679,15 @@ export const useForge = create<ForgeState>((set, get) => ({
   handleSocketInit: () => {
     if (socketBound) return;
     socketBound = true;
+    // reopen the last project after a page reload (progress + chat restore)
+    if (typeof window !== "undefined" && !get().activeProject) {
+      const last = localStorage.getItem("forge.lastProject");
+      if (last) {
+        void get()
+          .openProject(last)
+          .catch(() => localStorage.removeItem("forge.lastProject"));
+      }
+    }
     const s = getSocket();
     if (typeof window !== "undefined") {
       (window as unknown as { __forgeSocket: typeof s }).__forgeSocket = s;
@@ -514,6 +696,34 @@ export const useForge = create<ForgeState>((set, get) => ({
     s.on("connect", () => {
       const p = get().activeProject;
       if (p) joinProject(p.id);
+    });
+
+    // a turn started SERVER-SIDE (composer send, question continuation, restart)
+    // → bind the live stream here so events are never dropped
+    s.on("turn:started", ({ liveId }: { liveId: string }) => {
+      if (!liveId) return;
+      if (get().liveMessageId === liveId) return;
+      set({
+        liveMessageId: liveId,
+        isWorking: true,
+        agentActivity: get().agentActivity ?? "Working…",
+        lastError: null,
+      });
+      if (!get().messages.some((m) => m.id === liveId)) {
+        set({
+          messages: [
+            ...get().messages,
+            { id: liveId, role: "assistant", parts: [], createdAt: new Date().toISOString(), streaming: true },
+          ],
+        });
+      }
+    });
+
+    s.on("turn:ended", ({ liveId, ok }: { liveId: string | null; ok?: boolean }) => {
+      // message:final arrives right after; this only guards the failure path
+      if (!ok && liveId && get().liveMessageId === liveId) {
+        set({ agentActivity: null });
+      }
     });
 
     s.on("message:user", ({ id, parts, createdAt }) => {
@@ -592,6 +802,13 @@ export const useForge = create<ForgeState>((set, get) => ({
       void get().refreshGit();
       void get().refreshArtifacts();
       void get().bumpPreview();
+      // the backend auto-boots the dev server at turn end — its ready event may
+      // race the room join; poll briefly instead of showing "stopped" forever
+      for (const delay of [2500, 7000]) {
+        window.setTimeout(() => {
+          if (get().devServer.status === "stopped") void get().refreshDevServer();
+        }, delay);
+      }
     });
 
     s.on("agent:event", (e) => {
@@ -604,6 +821,8 @@ export const useForge = create<ForgeState>((set, get) => ({
           for (const part of parts) msgs[idx] = { ...msgs[idx], parts: mergeToolPart(msgs[idx].parts, part) };
           set({ messages: msgs });
         }
+        // auto checkpoints (project versions) land at turn end
+        void get().refreshGit();
       }
       switch (e.kind) {
         case "sandbox": {
@@ -620,7 +839,9 @@ export const useForge = create<ForgeState>((set, get) => ({
         }
         case "devserver": {
           const p = e.payload as Partial<DevServerState>;
+          const wasReady = get().devServer.status === "ready";
           set({ devServer: { ...get().devServer, ...p } });
+          if (p.status === "ready" && !wasReady) get().bumpPreview();
           if (p.status === "ready") set({ wsMode: "preview" });
           break;
         }

@@ -20,7 +20,7 @@ model Project {
   sandboxId      String?
   sandboxStatus  String   @default("stopped") // stopped|provisioning|running|error
   sandboxRuntime String   @default("local") // local|e2b
-  agentMode      String   @default("build") // plan|build|edit|yolo|auto
+  agentMode      String   @default("yolo") // plan|build|edit|yolo|auto — yolo is the default
   swarmEnabled   Boolean  @default(false)
   agentsActive   String   @default("[]")
   instructions   String?
@@ -38,6 +38,24 @@ model Project {
   artifacts   Artifact[]
   checkpoints Checkpoint[]
   swarmRuns   SwarmRun[]
+  sessions    ChatSession[]
+}
+
+// A chat session = one "task" on a project. A project can hold many sessions
+// (new task keeps the same project/workspace but a fresh conversation context).
+model ChatSession {
+  id            String   @id @default(cuid())
+  projectId     String
+  title         String   @default("New task")
+  coreSessionId String? // zcode core session id backing this chat session
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  project       Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  messages      AgentMessage[]
+  checkpoints   Checkpoint[]
+
+  @@index([projectId, updatedAt])
 }
 
 model ProjectFile {
@@ -54,15 +72,18 @@ model ProjectFile {
 }
 
 model AgentMessage {
-  id        String   @id @default(cuid())
+  id        String      @id @default(cuid())
   projectId String
+  sessionId String? // ChatSession id (nullable for legacy rows)
   role      String // user|assistant
-  parts     String   @default("[]") // JSON Part[]
+  parts     String      @default("[]") // JSON Part[]
   seq       Int
-  createdAt DateTime @default(now())
-  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  createdAt DateTime    @default(now())
+  project   Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  session   ChatSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
 
   @@unique([projectId, seq])
+  @@index([projectId, sessionId])
 }
 
 model AgentEvent {
@@ -90,13 +111,18 @@ model Artifact {
 }
 
 model Checkpoint {
-  id               String   @id @default(cuid())
+  id               String      @id @default(cuid())
   projectId        String
+  sessionId        String? // ChatSession id (session-scoped history)
   label            String
   commitHash       String?
   coreCheckpointId String?
-  createdAt        DateTime @default(now())
-  project          Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  major            Boolean     @default(false) // major checkpoints surface in project Version history
+  createdAt        DateTime    @default(now())
+  project          Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  session          ChatSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
+  @@index([projectId, major])
 }
 
 model Setting {

@@ -1,6 +1,7 @@
 // agent-service — file service, git service, artifacts scanner, dev-server manager (local),
 // terminal exec, exports. Local runtime SSOT = workspaces/<id>.
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { DEV_SERVER_PORT_MIN, DEV_SERVER_PORT_MAX, projectWorkspaceDir, safeJoin } from "./config";
@@ -49,19 +50,33 @@ export function buildFileTree(projectId: string): TreeNode[] {
 }
 
 export function readFileContent(projectId: string, rel: string): { content: string; size: number } {
-  const full = safeJoin(projectWorkspaceDir(projectId), rel);
+  const full = safeJoin(projectWorkspaceDir(projectId), normalizeWorkspacePath(projectId, rel));
   const stat = fs.statSync(full);
   return { content: fs.readFileSync(full, "utf8"), size: stat.size };
 }
 
 export function writeFileContent(projectId: string, rel: string, content: string): void {
-  const full = safeJoin(projectWorkspaceDir(projectId), rel);
+  const full = safeJoin(projectWorkspaceDir(projectId), normalizeWorkspacePath(projectId, rel));
   fs.mkdirSync(path.dirname(full), { recursive: true });
   fs.writeFileSync(full, content);
 }
 
+/** The agent often passes absolute paths — accept any path that lives inside this workspace. */
+function normalizeWorkspacePath(projectId: string, rel: string): string {
+  const ws = projectWorkspaceDir(projectId);
+  if (path.isAbsolute(rel)) {
+    const resolved = path.resolve(rel);
+    if (resolved === ws) return ".";
+    if (resolved.startsWith(ws + path.sep)) return path.relative(ws, resolved);
+    // e2b sandboxes use /home/user/workspace — map that too
+    const marker = "/home/user/workspace/";
+    if (resolved.startsWith(marker)) return resolved.slice(marker.length);
+  }
+  return rel;
+}
+
 export function createEntry(projectId: string, rel: string, type: "file" | "dir"): void {
-  const full = safeJoin(projectWorkspaceDir(projectId), rel);
+  const full = safeJoin(projectWorkspaceDir(projectId), normalizeWorkspacePath(projectId, rel));
   if (type === "dir") fs.mkdirSync(full, { recursive: true });
   else {
     fs.mkdirSync(path.dirname(full), { recursive: true });
@@ -70,7 +85,7 @@ export function createEntry(projectId: string, rel: string, type: "file" | "dir"
 }
 
 export function deleteEntry(projectId: string, rel: string): void {
-  const full = safeJoin(projectWorkspaceDir(projectId), rel);
+  const full = safeJoin(projectWorkspaceDir(projectId), normalizeWorkspacePath(projectId, rel));
   fs.rmSync(full, { recursive: true, force: true });
 }
 
@@ -317,6 +332,38 @@ function allocPort(): number {
   return DEV_SERVER_PORT_MIN;
 }
 
+/** True when nothing is listening on 127.0.0.1:<port>. Survives service restarts (orphan dev servers). */
+function portFree(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v: boolean) => {
+      if (settled) return;
+      settled = true;
+      try {
+        srv.close();
+        srv.unref();
+      } catch {
+        /* noop */
+      }
+      resolve(v);
+    };
+    const srv = net.createServer();
+    srv.once("error", () => done(false));
+    srv.once("listening", () => done(true));
+    srv.listen(port, "127.0.0.1");
+    setTimeout(() => done(false), 1500).unref();
+  });
+}
+
+async function allocFreePort(): Promise<number> {
+  const preferred = allocPort();
+  if (await portFree(preferred)) return preferred;
+  for (let p = DEV_SERVER_PORT_MIN; p <= DEV_SERVER_PORT_MAX; p++) {
+    if (await portFree(p)) return p;
+  }
+  return preferred;
+}
+
 export async function devServerAction(projectId: string, action: "start" | "stop" | "restart", framework: string, mode: string): Promise<Record<string, unknown>> {
   const dir = projectWorkspaceDir(projectId);
   if (action === "stop" || action === "restart") {
@@ -339,7 +386,7 @@ export async function devServerAction(projectId: string, action: "start" | "stop
     return { status: "ready", url: "static" };
   }
 
-  const port = allocPort();
+  const port = await allocFreePort();
   let cmd: string;
   if (framework === "nextjs") cmd = `npm install --no-audit --no-fund >/dev/null 2>&1; npx next dev -p ${port} -H 127.0.0.1`;
   else if (framework === "flask") cmd = `pip install -q -r requirements.txt >/dev/null 2>&1; python app.py`;
@@ -347,7 +394,8 @@ export async function devServerAction(projectId: string, action: "start" | "stop
   else {
     // stop postcss/tailwind config lookup from walking up into the platform tree
     if (!fs.existsSync(path.join(dir, "postcss.config.js"))) fs.writeFileSync(path.join(dir, "postcss.config.js"), "export default { plugins: [] };\n");
-    cmd = `npm install --no-audit --no-fund >/dev/null 2>&1; npx vite --port ${port} --host 127.0.0.1 --strictPort --base /preview/${projectId}/`;
+    // a stale vite optimizer cache poisons the module graph after reinstall — force a clean one
+    cmd = `rm -rf node_modules/.vite; npm install --no-audit --no-fund >/dev/null 2>&1; npx vite --force --port ${port} --host 127.0.0.1 --strictPort --base /preview/${projectId}/`;
   }
 
   await emitProjectEvent(projectId, "devserver", { status: "installing" });

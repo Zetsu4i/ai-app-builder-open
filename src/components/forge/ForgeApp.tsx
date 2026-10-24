@@ -6,6 +6,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { PanelLeft, RefreshCw } from "lucide-react";
+import { cn } from "@/lib/utils";
 import Sidebar from "./Sidebar";
 import TopBar from "./TopBar";
 import StatusBar from "./StatusBar";
@@ -82,6 +83,7 @@ function ForgeApp() {
   const setSidebarCollapsed = useForge((s) => s.setSidebarCollapsed);
   const setOverlay = useForge((s) => s.setOverlay);
   const setWsMode = useForge((s) => s.setWsMode);
+  const wsCollapsed = useForge((s) => s.wsCollapsed);
 
   // chat resizer (local, un-persisted — ported from the reference App.tsx)
   const [chatWidth, setChatWidth] = useState(400);
@@ -195,16 +197,25 @@ function ForgeApp() {
             <div className="flex min-h-0 flex-1">
               {!chatHidden ? (
                 <>
-                  <div style={{ width: chatWidth }} className="flex h-full shrink-0 flex-col border-r border-line">
+                  {/* workspace collapsed → chat expands to fill its space (no fixed width, no resizer) */}
+                  <div
+                    style={wsCollapsed ? undefined : { width: chatWidth }}
+                    className={cn(
+                      "flex h-full flex-col border-r border-line",
+                      wsCollapsed ? "min-w-0 flex-1" : "shrink-0",
+                    )}
+                  >
                     <ChatPanel />
                   </div>
-                  <div
-                    onMouseDown={onResizerDown}
-                    onDoubleClick={() => setChatHidden(true)}
-                    data-active={chatResizing}
-                    title="Drag to resize · double-click to hide chat"
-                    className="resizer w-[5px] shrink-0 bg-transparent"
-                  />
+                  {!wsCollapsed && (
+                    <div
+                      onMouseDown={onResizerDown}
+                      onDoubleClick={() => setChatHidden(true)}
+                      data-active={chatResizing}
+                      title="Drag to resize · double-click to hide chat"
+                      className="resizer w-[5px] shrink-0 bg-transparent"
+                    />
+                  )}
                 </>
               ) : (
                 <button
@@ -216,7 +227,14 @@ function ForgeApp() {
                   <span className="text-[11px] font-bold [writing-mode:vertical-lr]">CHAT</span>
                 </button>
               )}
-              <Workspace />
+              {wsCollapsed ? (
+                /* collapse the workspace pane to its 46px rail so the chat can fill the rest */
+                <div className="h-full w-[46px] shrink-0 overflow-hidden">
+                  <Workspace />
+                </div>
+              ) : (
+                <Workspace />
+              )}
             </div>
             <StatusBar />
           </>

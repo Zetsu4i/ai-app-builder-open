@@ -74,6 +74,19 @@ export const MODE_RULES: Record<string, string> = {
 1. Datasets under datasets/, charts under output/, findings in REPORT.md.
 2. Verify numbers before claiming them.
 3. Maintain PLAN.md / TODO.md / WORKLOG.md.`,
+  reverse: `## System Capabilities
+- REA (Reverse Engineering Agents) MCP available — prefer its tools for static and dynamic binary analysis.
+- Ghidra headless at /opt/ghidra/support/analyzeHeadless (E2B template) — use for decompilation and function mapping.
+- radare2 (r2, rabin2, rasm2), binwalk, strings, file, xxdd, ltrace/strace where available.
+- Python 3.11 (capstone, pwn tools as needed) for scripts under scripts/.
+- Full read access to samples/; write analysis artifacts under extracted/ and reports to RECON.md / FINDINGS.md.
+
+## Operational Rules
+1. TRIAGE FIRST: file type, hashes (sha256/md5), strings, binwalk signatures — record in RECON.md before deep analysis.
+2. STATIC BEFORE DYNAMIC: map functions and decompile with Ghidra/radare2 before running anything; dynamic analysis only in a sandbox, never on host-critical paths.
+3. EVIDENCE-GATED CLAIMS: every finding in FINDINGS.md cites evidence (offset, function name, decompiled snippet, command output). Never guess.
+4. Prefer REA MCP commands when present; fall back to r2/ghidra CLI. Keep original samples immutable under samples/.
+5. Maintain PLAN.md / TODO.md / WORKLOG.md (append a Task ID section per analysis pass).`,
 };
 
 export function agentsMdFor(modeName: string, rules: string): string {

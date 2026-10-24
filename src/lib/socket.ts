@@ -15,6 +15,8 @@ import type {
 
 export interface ServerToClientEvents {
   hydrate: (payload: unknown) => void;
+  "turn:started": (payload: { liveId: string; projectId: string; sessionId: string | null }) => void;
+  "turn:ended": (payload: { liveId: string | null; projectId: string; ok: boolean }) => void;
   "message:user": (payload: { id: string; role: "user"; parts: unknown[]; createdAt: string }) => void;
   "message:delta": (payload: SocketMessageDelta) => void;
   "message:reasoning-delta": (payload: SocketMessageDelta) => void;

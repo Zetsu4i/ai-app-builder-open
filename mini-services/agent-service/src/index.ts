@@ -22,6 +22,7 @@ import {
   syncUp,
   syncDown,
   sandboxDevServerAction,
+  sandboxDevServerInfo,
 } from "./sandbox";
 import { resolveMode, seedWorkspaceIfNeeded, generateTitle, nextWorklogTaskId, appendWorklogRunHeader } from "./workspace";
 import {
@@ -49,7 +50,8 @@ import {
 } from "./services";
 import { startSwarm, stopSwarm, currentRun } from "./swarm";
 import * as mgr from "./managers";
-import { emitProjectEvent, persistUserMessage, nextMessageSeq } from "./turns";
+import { emitProjectEvent, persistUserMessage, nextMessageSeq, activeChatSession, liveStateForProject } from "./turns";
+import { maybeAutoStartDevServer } from "./devserver-autostart";
 import { BUILTIN_MODES } from "./modes";
 
 ensureDirs();
@@ -111,6 +113,25 @@ async function policyFor(projectId: string): Promise<"yolo" | "auto" | "ask"> {
 function json(res: http.ServerResponse, code: number, data: unknown) {
   res.writeHead(code, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
   res.end(JSON.stringify(data));
+}
+
+/** Every project always has one ACTIVE chat session ("task"). Legacy null-session rows are backfilled. */
+async function ensureDefaultSession(projectId: string) {
+  let row = await db.chatSession.findFirst({ where: { projectId, isActive: true }, orderBy: { updatedAt: "desc" } });
+  if (!row) {
+    const any = await db.chatSession.findFirst({ where: { projectId }, orderBy: { createdAt: "asc" } });
+    row =
+      any ??
+      (await db.chatSession.create({
+        data: { projectId, title: "Task 1", isActive: true },
+      }));
+    await db.chatSession.updateMany({ where: { projectId, id: { not: row.id } }, data: { isActive: false } });
+    await db.chatSession.update({ where: { id: row.id }, data: { isActive: true } });
+    // legacy rows (created before sessions existed) belong to the first session
+    await db.agentMessage.updateMany({ where: { projectId, sessionId: null }, data: { sessionId: row.id } });
+    await db.checkpoint.updateMany({ where: { projectId, sessionId: null }, data: { sessionId: row.id } });
+  }
+  return row;
 }
 
 async function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
@@ -208,13 +229,14 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
           docType: mc.docType ?? null,
         }),
         swarmEnabled: modeDef.swarmAllowed ? !!body.swarm : false,
-        agentMode: String(body.agentMode || "build"),
+        agentMode: String(body.agentMode || "yolo"),
         instructions: (mc.instructions as string) || null,
         initialPrompt: body.initialPrompt ? String(body.initialPrompt) : null,
         hue: Math.floor(Math.random() * 360),
       },
     });
     await seedWorkspaceIfNeeded(project.id, mode, framework, mc);
+    await ensureDefaultSession(project.id);
     // install design system into workspace if selected
     if (mc.designSystem) {
       const { installDesignSystemToWorkspace } = await import("./managers");
@@ -258,24 +280,75 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
     const id = m[1];
     const row = await db.project.findUnique({ where: { id } });
     if (!row) return json(res, 404, { error: "not found" });
-    const [messages, events, artifacts, checkpoints, usage, devserver, swarmRun] = await Promise.all([
-      db.agentMessage.findMany({ where: { projectId: id }, orderBy: { seq: "asc" } }),
+    const session = await ensureDefaultSession(id);
+    const requestedSid = url.searchParams.get("sessionId");
+    const activeSid = requestedSid && requestedSid !== session.id ? requestedSid : session.id;
+    const [
+      messages,
+      events,
+      artifacts,
+      sessionCheckpoints,
+      versions,
+      sessions,
+      sessionCounts,
+      usage,
+      devserver,
+      swarmRun,
+    ] = await Promise.all([
+      db.agentMessage.findMany({ where: { projectId: id, sessionId: activeSid }, orderBy: { seq: "asc" } }),
       db.agentEvent.findMany({ where: { projectId: id }, orderBy: { seq: "desc" }, take: 200 }),
       db.artifact.findMany({ where: { projectId: id }, orderBy: { createdAt: "desc" } }),
-      db.checkpoint.findMany({ where: { projectId: id }, orderBy: { createdAt: "desc" }, take: 30 }),
+      db.checkpoint.findMany({ where: { OR: [{ sessionId: activeSid }, { projectId: id, sessionId: null }] }, orderBy: { createdAt: "desc" }, take: 30 }),
+      db.checkpoint.findMany({ where: { projectId: id, major: true }, orderBy: { createdAt: "desc" }, take: 40 }),
+      db.chatSession.findMany({ where: { projectId: id }, orderBy: { createdAt: "asc" } }),
+      db.agentMessage.groupBy({ by: ["sessionId"], where: { projectId: id }, _count: { _all: true } }),
       getRuntime().usage(id).catch(() => null),
-      Promise.resolve(devServerInfo(id)),
+      Promise.resolve(isE2BActive(id) ? sandboxDevServerInfo(id) : devServerInfo(id)),
       currentRun(id).catch(() => null),
     ]);
+    const countBy = new Map(sessionCounts.filter((c) => c.sessionId).map((c) => [c.sessionId as string, c._count._all]));
+    // live turn (agent may still be working — re-attach instead of losing it)
+    const turn = liveStateForProject(getRuntime(), id);
+    // unresolved permission / question waiting on the user
+    const pendingRef = getRuntime().pendingForProject(id);
+    let pending: Record<string, unknown> | null = null;
+    if (pendingRef) {
+      const evRows = await db.agentEvent.findMany({
+        where: { projectId: id, kind: pendingRef.kind === "permission" ? "approval" : "question" },
+        orderBy: { seq: "desc" },
+        take: 12,
+      });
+      for (const ev of evRows) {
+        const payload = JSON.parse(ev.payload || "{}") as Record<string, unknown>;
+        if (payload.requestId === pendingRef.requestId && payload.state === "pending") {
+          pending = { type: pendingRef.kind, ...payload };
+          break;
+        }
+      }
+      if (!pending) pending = { type: pendingRef.kind, requestId: pendingRef.requestId };
+    }
+    void maybeAutoStartDevServer(id, "hydrate");
     return json(res, 200, {
       project: projectDto(row),
+      sessionId: session.id,
+      sessions: sessions.map((s) => ({
+        id: s.id,
+        title: s.title,
+        isActive: s.isActive || s.id === activeSid,
+        messageCount: countBy.get(s.id) ?? 0,
+        createdAt: s.createdAt.toISOString(),
+        updatedAt: s.updatedAt.toISOString(),
+      })),
       messages: messages.map((msg) => ({ id: msg.id, role: msg.role, parts: JSON.parse(msg.parts || "[]"), createdAt: msg.createdAt.toISOString() })),
       events: events.reverse().map((e) => ({ id: e.id, kind: e.kind, payload: JSON.parse(e.payload || "{}"), seq: e.seq, createdAt: e.createdAt.toISOString() })),
       artifacts,
-      checkpoints,
+      checkpoints: sessionCheckpoints,
+      versions,
+      turn,
+      pending,
       fileTree: buildFileTree(id),
       sandbox: sandboxInfo(id),
-      devServer: { status: devserver.status, port: devserver.port },
+      devServer: { status: devserver.status, port: devserver.port, cloudUrl: (devserver as { cloudUrl?: string }).cloudUrl },
       swarmRun: swarmRun
         ? {
             id: swarmRun.id,
@@ -293,6 +366,60 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
         ? { contextUsed: (usage as { contextUsed?: number }).contextUsed ?? 0, contextWindow: (usage as { contextWindow?: number }).contextWindow ?? 200000, totalTokens: (usage as { totalTokens?: number }).totalTokens ?? 0 }
         : null,
     });
+  }
+
+  // ---------- chat sessions ("tasks" on the same project) ----------
+  m = p.match(/^\/api\/projects\/([^/]+)\/sessions$/);
+  if (m && method === "GET") {
+    const id = m[1];
+    await ensureDefaultSession(id);
+    const rows = await db.chatSession.findMany({ where: { projectId: id }, orderBy: { createdAt: "asc" } });
+    const counts = await db.agentMessage.groupBy({ by: ["sessionId"], where: { projectId: id }, _count: { _all: true } });
+    const countBy = new Map(counts.filter((c) => c.sessionId).map((c) => [c.sessionId as string, c._count._all]));
+    return json(res, 200, {
+      sessions: rows.map((s) => ({
+        id: s.id,
+        title: s.title,
+        isActive: s.isActive,
+        messageCount: countBy.get(s.id) ?? 0,
+        createdAt: s.createdAt.toISOString(),
+        updatedAt: s.updatedAt.toISOString(),
+      })),
+    });
+  }
+  if (m && method === "POST") {
+    const id = m[1];
+    const row = await db.project.findUnique({ where: { id } });
+    if (!row) return json(res, 404, { error: "not found" });
+    await getRuntime().stop(id).catch(() => undefined);
+    const count = await db.chatSession.count({ where: { projectId: id } });
+    await db.chatSession.updateMany({ where: { projectId: id }, data: { isActive: false } });
+    const created = await db.chatSession.create({
+      data: {
+        projectId: id,
+        title: String(body.title || `Task ${count + 1}`),
+        isActive: true,
+      },
+    });
+    await db.project.update({ where: { id }, data: { coreSessionId: null } });
+    getRuntime().resetSession(id);
+    await emitProjectEvent(id, "status", { sessionSwitched: created.id });
+    return json(res, 200, { session: { id: created.id, title: created.title, isActive: true, messageCount: 0, createdAt: created.createdAt.toISOString(), updatedAt: created.updatedAt.toISOString() } });
+  }
+
+  m = p.match(/^\/api\/projects\/([^/]+)\/sessions\/([^/]+)\/activate$/);
+  if (m && method === "POST") {
+    const id = m[1];
+    const sid = m[2];
+    const row = await db.chatSession.findUnique({ where: { id: sid } });
+    if (!row || row.projectId !== id) return json(res, 404, { error: "session not found" });
+    await getRuntime().stop(id).catch(() => undefined);
+    await db.chatSession.updateMany({ where: { projectId: id }, data: { isActive: false } });
+    await db.chatSession.update({ where: { id: sid }, data: { isActive: true } });
+    await db.project.update({ where: { id }, data: { coreSessionId: row.coreSessionId } });
+    getRuntime().resetSession(id);
+    await emitProjectEvent(id, "status", { sessionSwitched: sid });
+    return json(res, 200, { ok: true });
   }
 
   // ---------- chat / turn lifecycle ----------
@@ -343,17 +470,28 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
         }
 
         // 4. persist user message + start turn
+        await ensureDefaultSession(id);
         await persistUserMessage(id, content);
         const runtime = getRuntime();
         const modelPref = await mgr.getRawSetting("defaultModel");
         const defaultModel = typeof modelPref === "object" && modelPref ? (modelPref as { defaultModel?: string }).defaultModel : undefined;
         const mcps = await mgr.mcpsForSession((modeConfig.mcpServers as string[]) || undefined);
         await runtime.ensureForProject(id, dir, defaultModel, mcps);
+        // bind the core session to the active chat session + auto-title the task
+        const coreSessionId = runtime.getSessionId(id);
+        const chatSession = await activeChatSession(id);
+        if (chatSession) {
+          const data: Record<string, unknown> = { coreSessionId, updatedAt: new Date() };
+          if (chatSession.title.startsWith("Task ")) data.title = content.split("\n")[0].slice(0, 60);
+          await db.chatSession.update({ where: { id: chatSession.id }, data }).catch(() => undefined);
+        }
         // update policy cache before turn
         await policyFor(id);
         const ok = await runtime.send(id, content);
         if (!ok) throw new Error("no active session for project");
         await mgr.bumpUsage({ modelRequestCount: 1 });
+        // the preview should come alive by itself once the first turn starts
+        void maybeAutoStartDevServer(id, "turn-end");
       } catch (e) {
         console.error("[chat] turn failed:", (e as Error).message);
         await emitProjectEvent(id, "error", { message: (e as Error).message, kind: "turn" });
@@ -477,8 +615,13 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
   }
   m = p.match(/^\/api\/projects\/([^/]+)\/checkpoints$/);
   if (m && method === "GET") {
-    const checkpoints = await db.checkpoint.findMany({ where: { projectId: m[1] }, orderBy: { createdAt: "desc" }, take: 30 });
+    const checkpoints = await db.checkpoint.findMany({ where: { projectId: m[1] }, orderBy: { createdAt: "desc" }, take: 60 });
     return json(res, 200, { checkpoints });
+  }
+  m = p.match(/^\/api\/projects\/([^/]+)\/versions$/);
+  if (m && method === "GET") {
+    const versions = await db.checkpoint.findMany({ where: { projectId: m[1], major: true }, orderBy: { createdAt: "desc" }, take: 60 });
+    return json(res, 200, { versions });
   }
 
   // ---------- github ----------
@@ -513,7 +656,12 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
   m = p.match(/^\/api\/projects\/([^/]+)\/artifacts\/raw$/);
   if (m && method === "GET") {
     const rel = url.searchParams.get("path") || "";
-    const full = path.join(projectWorkspaceDir(m[1]), rel);
+    const wsDir = projectWorkspaceDir(m[1]);
+    let full = path.join(wsDir, rel);
+    if (path.isAbsolute(rel)) {
+      const resolved = path.resolve(rel);
+      if (resolved.startsWith(wsDir + path.sep)) full = resolved;
+    }
     try {
       const mime = mimeFor(rel);
       if (mime.startsWith("text/") || mime === "application/json") {
@@ -531,7 +679,7 @@ async function route(req: http.IncomingMessage, res: http.ServerResponse): Promi
   m = p.match(/^\/api\/projects\/([^/]+)\/devserver$/);
   if (m) {
     const id = m[1];
-    if (method === "GET") return json(res, 200, devServerInfo(id));
+    if (method === "GET") return json(res, 200, isE2BActive(id) ? sandboxDevServerInfo(id) : devServerInfo(id));
     if (method === "POST") {
       const row = await db.project.findUnique({ where: { id } });
       const isE2B = isE2BActive(id);

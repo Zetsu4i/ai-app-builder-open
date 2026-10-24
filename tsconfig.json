@@ -37,6 +37,13 @@
     ".next/dev/types/**/*.ts"
   ],
   "exclude": [
-    "node_modules"
+    "node_modules",
+    "mini-services",
+    "agent-core",
+    "packs",
+    "skills",
+    "workspaces",
+    "swarm-runs",
+    "vendored-context-mode"
   ]
 }

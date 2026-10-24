@@ -232,6 +232,13 @@ export function allocDevPort(): number {
   return DEV_SERVER_PORT_MIN;
 }
 
+/** Dev-server state living inside the sandbox (for hydrate + preview gate). */
+export function sandboxDevServerInfo(projectId: string): { status: string; port?: number; cloudUrl?: string } {
+  const entry = sandboxes.get(projectId);
+  if (!entry?.devServer) return { status: "stopped" };
+  return { status: entry.devServer.status, port: entry.devServer.port, cloudUrl: entry.devServer.cloudUrl };
+}
+
 export async function sandboxDevServerAction(
   projectId: string,
   action: "start" | "stop",
@@ -245,13 +252,16 @@ export async function sandboxDevServerAction(
     entry.devServer = undefined;
     return { status: "stopped" };
   }
+  // already running / starting → report instead of double-booting
+  if (entry.devServer?.status === "ready") return { status: "ready", url: entry.devServer.cloudUrl };
+  if (entry.devServer?.status === "starting") return { status: "starting", url: entry.devServer.cloudUrl };
   const port = allocDevPort();
   const cmd =
     framework === "nextjs"
       ? `cd /home/user/workspace && npm install --no-audit --no-fund >/dev/null 2>&1; PORT=${port} npx next dev -p ${port} -H 0.0.0.0`
       : framework === "flask"
         ? `cd /home/user/workspace && pip install -q -r requirements.txt >/dev/null 2>&1; python app.py`
-        : `cd /home/user/workspace && npm install --no-audit --no-fund >/dev/null 2>&1; npx vite --port ${port} --host 0.0.0.0 --strictPort`;
+        : `cd /home/user/workspace && rm -rf node_modules/.vite && npm install --no-audit --no-fund >/dev/null 2>&1; npx vite --force --port ${port} --host 0.0.0.0 --strictPort`;
   await sb.commands.run(cmd, { background: true, timeoutMs: 15 * 60_000 });
   const cloudUrl = `https://${sb.getHost(port)}`;
   // readiness poll

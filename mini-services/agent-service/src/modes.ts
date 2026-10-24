@@ -124,6 +124,41 @@ const DATA_SEED: SeedFile[] = [
   { path: "datasets/README.md", content: "Place datasets here.\n" },
 ];
 
+const REVERSE_SEED: SeedFile[] = [
+  {
+    path: "RECON.md",
+    content: `# Reconnaissance
+
+## Target
+- File / binary: (path, sha256, size, type)
+- Tooling used: (ghidra headless / radare2 / binwalk / strings / REA MCP)
+
+## Surface
+- Entry points, exported functions, embedded strings, packed/obfuscated sections
+
+## Findings
+- (append as you work)
+`,
+  },
+  {
+    path: "FINDINGS.md",
+    content: `# Findings
+
+| # | Finding | Evidence | Confidence |
+|---|---------|----------|------------|
+| 1 | (what you discovered) | (function/offset/output) | low/med/high |
+
+## IOCs / Indicators
+- (hashes, strings, domains, mutexes…)
+
+## Recommendations
+- (patch / hardening / detection ideas)
+`,
+  },
+  { path: "samples/.gitkeep", content: "" },
+  { path: "scripts/README.md", content: "Analysis scripts live here (r2 scripts, ghidra post-scripts, python helpers).\n" },
+];
+
 export const BUILTIN_MODES: ModeDef[] = [
   {
     slug: "web",
@@ -266,6 +301,24 @@ export const BUILTIN_MODES: ModeDef[] = [
     swarmAllowed: true,
     directive:
       "You are a DATA analyst. Python 3 with pandas/numpy/matplotlib/plotly/scipy is preinstalled. Put datasets under datasets/, charts under output/, and write findings to REPORT.md. Show your intermediate steps; verify numbers before claiming them.",
+    skills: ["dynamic-workflows"],
+  },
+  {
+    slug: "reverse",
+    name: "Reverse Engineering",
+    icon: "Binary",
+    color: "#3f3f46",
+    description: "Binary & protocol analysis with REA tooling",
+    frameworks: ["python"],
+    defaultFramework: "python",
+    samplePrompts: [
+      "Analyze the binary in samples/, map the entry point and key functions, and document the control flow",
+      "Extract embedded strings, flags and configs from this executable and write an IOC report",
+      "Reverse the protocol of this capture and build a python parser for it",
+    ],
+    swarmAllowed: true,
+    directive:
+      "You are a SENIOR REVERSE ENGINEER. Work methodically: triage (file/strings/binwalk) → static analysis (ghidra headless / radare2) → dynamic analysis when safe → document everything in RECON.md and FINDINGS.md with evidence (offsets, function names, decompiled snippets). Prefer the REA MCP tools when available for static and dynamic binary analysis. Decompile BEFORE guessing; never claim behavior you did not observe. Keep original samples intact under samples/ and write extracted artifacts under extracted/.",
     skills: ["dynamic-workflows"],
   },
 ];

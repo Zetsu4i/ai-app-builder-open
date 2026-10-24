@@ -8,7 +8,7 @@ import { useEffect, useState } from "react";
 import {
   Monitor, Smartphone, Palette, FileText, Check, Puzzle,
   Blocks, Users, Cpu, Info, Layers2, SlidersHorizontal, X,
-  Sparkles, Presentation, MousePointerClick, BarChart3, Globe,
+  Sparkles, Presentation, MousePointerClick, BarChart3, Globe, Binary,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import * as api from "@/lib/api";
@@ -28,6 +28,7 @@ export const MODES: { id: string; label: string; icon: typeof Monitor; desc: str
   { id: "document", label: "Document", icon: FileText, desc: "Reports and structured docs", target: "Markdown / PDF" },
   { id: "computer", label: "Computer Use", icon: MousePointerClick, desc: "Drive a real browser", target: "Chromium session" },
   { id: "data", label: "Data Analysis", icon: BarChart3, desc: "Datasets, charts, insights", target: "Tables + charts" },
+  { id: "reverse", label: "Reverse Engineering", icon: Binary, desc: "Binary & protocol analysis with REA tooling", target: "Ghidra + REA MCP" },
 ];
 
 const MODE_FRAMEWORKS: Record<string, string[]> = {
@@ -39,7 +40,12 @@ const MODE_FRAMEWORKS: Record<string, string[]> = {
   document: ["Markdown", "MDX", "LaTeX", "Notion export"],
   computer: ["Playwright", "Puppeteer", "CDP"],
   data: ["Pandas", "DuckDB", "SQLite", "Observable"],
+  reverse: ["Python"],
 };
+
+/** slug → icon for the builtin modes (custom modes fall back to Sparkles). */
+const ICON_BY_MODE: Record<string, typeof Monitor> = Object.fromEntries(MODES.map((m) => [m.id, m.icon] as const));
+const modeIconFor = (slug: string): typeof Monitor => ICON_BY_MODE[slug] ?? Sparkles;
 
 export const STYLES = [
   "Warm editorial", "Scandinavian minimal", "Brutalist grid", "Soft glass",
@@ -362,6 +368,272 @@ export function SettingsSheet() {
           </div>
         )}
       </Section>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  ComposerConfigPanel — one scrollable panel with EVERYTHING          */
+/*  (mode, framework, design system, style, agent mode, swarm,          */
+/*  skills, MCPs). Opened from the HomeScreen +/Edit buttons.           */
+/* ------------------------------------------------------------------ */
+
+export function ComposerConfigPanel({ onClose }: { onClose: () => void }) {
+  const config = useForge((s) => s.composer);
+  const setComposer = useForge((s) => s.setComposer);
+  const modes = useModes();
+  const designSystems = useDesignSystems();
+  const skills = useSkills();
+  const mcps = useMcps();
+
+  const currentMode = modes.find((m) => m.slug === config.mode);
+  const frameworks = frameworksFor(config.mode);
+  const swarmDisabled = config.mode === "design" || (currentMode ? !currentMode.swarmAllowed : false);
+
+  const set = <K extends keyof ComposerConfig>(k: K, v: ComposerConfig[K]) =>
+    setComposer({ [k]: v } as Partial<ComposerConfig>);
+
+  const toggleIn = (key: "skills" | "mcps", id: string) => {
+    const cur = config[key];
+    const has = cur.includes(id);
+    setComposer({ [key]: has ? cur.filter((x) => x !== id) : [...cur, id] } as Partial<ComposerConfig>);
+  };
+
+  return (
+    <div className="flex max-h-[70vh] w-[340px] flex-col overflow-hidden rounded-xl border border-line bg-card text-ink shadow-2xl">
+      {/* header */}
+      <div className="flex shrink-0 items-center gap-2 border-b border-line-soft px-3 py-2.5">
+        <SlidersHorizontal size={12} className="text-muted" />
+        <span className="text-[11px] font-bold uppercase tracking-wider text-muted">Task setup</span>
+        <span className="truncate rounded bg-black/[0.06] px-1.5 py-0.5 text-[9.5px] font-bold uppercase text-ink-soft">
+          {config.mode} mode
+        </span>
+        <button
+          onClick={onClose}
+          title="Close"
+          className="ml-auto flex h-5 w-5 items-center justify-center rounded text-muted transition hover:bg-black/5 hover:text-ink"
+        >
+          <X size={12} />
+        </button>
+      </div>
+
+      {/* scrollable body */}
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        {/* mode */}
+        <Section icon={Blocks} title="Mode">
+          <div className="space-y-1">
+            {modes.map((m) => {
+              const I = modeIconFor(m.slug);
+              const on = config.mode === m.slug;
+              return (
+                <button
+                  key={m.slug}
+                  onClick={() => setComposer({ mode: m.slug, framework: m.frameworks[0] ?? "" })}
+                  className={cn(
+                    "flex w-full items-center gap-2.5 rounded-lg border px-2 py-1.5 text-left transition",
+                    on ? "border-ink/25 bg-black/[0.05]" : "border-transparent hover:bg-black/[0.04]",
+                  )}
+                >
+                  <I size={14} className={cn("shrink-0", on ? "text-clay" : "text-muted")} />
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-[12px] font-semibold text-ink">
+                      {m.name}
+                      {!m.isBuiltin && (
+                        <span className="ml-1.5 rounded bg-black/[0.06] px-1 py-0.5 text-[8.5px] font-bold uppercase tracking-wide text-muted">
+                          custom
+                        </span>
+                      )}
+                    </span>
+                    <span className="block truncate text-[9.5px] text-muted">{m.description}</span>
+                  </span>
+                  {on && <Check size={12} className="shrink-0 text-moss" />}
+                </button>
+              );
+            })}
+          </div>
+        </Section>
+
+        {/* framework */}
+        {frameworks.length > 0 && (
+          <Section icon={SlidersHorizontal} title="Framework">
+            <div className="flex flex-wrap gap-1.5">
+              {frameworks.map((f) => (
+                <Chip key={f} on={config.framework === f} onClick={() => set("framework", f)}>
+                  {f}
+                </Chip>
+              ))}
+            </div>
+          </Section>
+        )}
+
+        {/* design system */}
+        <Section icon={Info} title="Design system">
+          <div className="space-y-1">
+            {designSystems.map((d) => {
+              const on = config.designSystem === d.slug;
+              const colors = dsColors(d.slug);
+              return (
+                <button
+                  key={d.slug}
+                  onClick={() => set("designSystem", on ? null : d.slug)}
+                  className={cn(
+                    "flex w-full items-center gap-2 rounded-lg border px-2 py-1.5 text-left text-[12px] transition",
+                    on ? "border-ink bg-ink/[0.05] font-semibold text-ink" : "border-line bg-card text-ink-soft hover:border-ink/20",
+                  )}
+                >
+                  <span className="flex shrink-0 gap-0.5">
+                    {colors.map((c, i) => (
+                      <span key={i} className="h-3 w-3 rounded-[3px] border border-black/10" style={{ background: c }} />
+                    ))}
+                  </span>
+                  <span className="min-w-0 flex-1 truncate">
+                    {d.name}
+                    {d.category && <span className="ml-1.5 text-[10px] font-normal text-muted">{d.category}</span>}
+                  </span>
+                  {on && <Check size={12} className="ml-auto shrink-0 text-moss" />}
+                </button>
+              );
+            })}
+          </div>
+        </Section>
+
+        {/* visual style */}
+        <Section icon={Layers2} title="Visual style">
+          <div className="flex flex-wrap gap-1.5">
+            {STYLES.map((s) => (
+              <Chip key={s} on={config.style === s} onClick={() => set("style", config.style === s ? null : s)}>
+                {s}
+              </Chip>
+            ))}
+          </div>
+        </Section>
+
+        {/* agent mode */}
+        <Section icon={Cpu} title="Agent mode" hint="how autonomous the agent is">
+          <div className="flex flex-wrap gap-1.5">
+            {AGENT_MODES.map((m) => {
+              const on = config.agentMode === m.id;
+              return (
+                <Chip key={m.id} on={on} onClick={() => set("agentMode", m.id)}>
+                  {m.label}
+                  {m.id === "yolo" && (
+                    <span
+                      className={cn(
+                        "rounded px-1 py-px text-[9px] font-bold uppercase tracking-wide",
+                        on ? "bg-white/25" : "bg-black/[0.08]",
+                      )}
+                    >
+                      default
+                    </span>
+                  )}
+                  <span className="text-[9.5px] font-normal opacity-70">{m.note}</span>
+                </Chip>
+              );
+            })}
+          </div>
+        </Section>
+
+        {/* swarm */}
+        <Section
+          icon={Users}
+          title="Swarm mode"
+          hint={swarmDisabled ? (config.mode === "design" ? "not available in design mode" : "not available for this mode") : "parallel sub-agents"}
+        >
+          <button
+            onClick={() => !swarmDisabled && set("swarm", !config.swarm)}
+            disabled={swarmDisabled}
+            className={cn(
+              "flex w-full items-center gap-2.5 rounded-xl border px-3 py-2.5 text-left transition",
+              config.swarm && !swarmDisabled ? "border-clay/40 bg-clay/[0.06]" : "border-line bg-card hover:border-ink/20",
+              swarmDisabled && "cursor-not-allowed opacity-60",
+            )}
+          >
+            <span
+              className={cn(
+                "flex h-8 w-8 shrink-0 items-center justify-center rounded-lg",
+                config.swarm && !swarmDisabled ? "bg-clay text-white" : "bg-black/[0.06] text-ink-soft",
+              )}
+            >
+              <Users size={15} />
+            </span>
+            <span className="min-w-0 flex-1">
+              <span className="block text-[12.5px] font-semibold text-ink">Orchestrate parallel agents</span>
+              <span className="block text-[11px] leading-snug text-muted">
+                An orchestrator decomposes the task and runs sub-agents concurrently.
+              </span>
+            </span>
+            <span className="toggle shrink-0" data-on={config.swarm && !swarmDisabled} />
+          </button>
+          {config.swarm && !swarmDisabled && (
+            <div className="anim-fade-in mt-2 rounded-xl border border-line bg-cream px-3 py-2.5">
+              <div className="flex items-center justify-between">
+                <span className="text-[11.5px] font-semibold">Agents in swarm</span>
+                <span className="font-mono text-[12px] font-bold text-ink">{config.swarmAgents}</span>
+              </div>
+              <input
+                type="range"
+                min={2}
+                max={8}
+                value={config.swarmAgents}
+                onChange={(e) => set("swarmAgents", Number(e.target.value))}
+                className="mt-2 w-full"
+              />
+            </div>
+          )}
+        </Section>
+
+        {/* skills */}
+        <Section icon={Puzzle} title="Skills" hint={`${config.skills.length} selected`}>
+          {skills.length === 0 ? (
+            <p className="px-1 py-2 text-[11px] text-muted">No skills installed yet.</p>
+          ) : (
+            <div className="space-y-1">
+              {skills.map((s) => (
+                <ToggleRow
+                  key={s.slug}
+                  label={s.name}
+                  note={[s.description, s.source].filter(Boolean).join(" · ")}
+                  on={config.skills.includes(s.slug)}
+                  onToggle={() => toggleIn("skills", s.slug)}
+                />
+              ))}
+            </div>
+          )}
+        </Section>
+
+        {/* MCPs */}
+        <Section icon={Blocks} title="MCP servers" hint={`${config.mcps.length} selected`}>
+          {mcps.length === 0 ? (
+            <p className="px-1 py-2 text-[11px] text-muted">No MCP servers configured.</p>
+          ) : (
+            <div className="space-y-1">
+              {mcps.map((m) => (
+                <ToggleRow
+                  key={m.id}
+                  label={m.name}
+                  note={m.status ? `${m.type} · ${m.status}` : m.type}
+                  on={config.mcps.includes(m.name)}
+                  onToggle={() => toggleIn("mcps", m.name)}
+                />
+              ))}
+            </div>
+          )}
+        </Section>
+      </div>
+
+      {/* footer */}
+      <div className="shrink-0 border-t border-line-soft bg-cream px-3 py-2.5">
+        <p className="text-[10px] leading-relaxed text-muted">
+          {config.skills.length} skills · {config.mcps.length} MCPs · agent mode{" "}
+          <span className="font-semibold text-ink-soft">{config.agentMode}</span>
+        </p>
+        <button
+          onClick={onClose}
+          className="mt-2 w-full rounded-lg bg-ink py-2 text-[12px] font-semibold text-white transition hover:bg-stone-800"
+        >
+          Done
+        </button>
+      </div>
     </div>
   );
 }

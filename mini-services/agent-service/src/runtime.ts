@@ -398,6 +398,7 @@ type PendingInteraction = {
   resolve: (v: Json) => void;
   timer: ReturnType<typeof setTimeout>;
   kind: "permission" | "question";
+  projectId?: string;
 };
 
 export interface RuntimeDeps {
@@ -562,9 +563,9 @@ export class ZCodeRuntime {
     const promise = new Promise<Json>((resolve) => {
       const timer = setTimeout(() => {
         this.pendingInteractions.delete(requestId);
-        resolve({ decision: "deny", reason: "approval timeout (60s)" });
-      }, 60000);
-      this.pendingInteractions.set(requestId, { pending: { resolve, timer, kind: "permission" }, conn });
+        resolve({ decision: "deny", reason: "approval timeout (120s)" });
+      }, 120000);
+      this.pendingInteractions.set(requestId, { pending: { resolve, timer, kind: "permission", projectId }, conn });
     });
     this.deps.io.to(`project:${projectId}`).emit("permission:request", {
       requestId,
@@ -599,8 +600,8 @@ export class ZCodeRuntime {
       const timer = setTimeout(() => {
         this.pendingInteractions.delete(requestId);
         resolve({ action: "accept", content: defaultContent(), reason: "timeout default" });
-      }, 120000);
-      this.pendingInteractions.set(requestId, { pending: { resolve, timer, kind: "question" }, conn });
+      }, 300000);
+      this.pendingInteractions.set(requestId, { pending: { resolve, timer, kind: "question", projectId }, conn });
     });
     this.deps.io.to(`project:${projectId}`).emit("question:request", {
       requestId,
@@ -608,8 +609,10 @@ export class ZCodeRuntime {
       prompt: p.prompt,
       questions: p.questions || [],
     });
+    await this.deps.emitEvent(projectId, "question", { requestId, prompt: p.prompt, questions: p.questions || [], state: "pending" });
     const result = await promise;
     conn.respond(id, result);
+    await this.deps.emitEvent(projectId, "question", { requestId, state: "resolved" });
   }
 
   resolveInteraction(requestId: string, result: Json): boolean {
@@ -619,6 +622,23 @@ export class ZCodeRuntime {
     this.pendingInteractions.delete(requestId);
     entry.pending.resolve(result);
     return true;
+  }
+
+  /** Unresolved interaction waiting on the user for this project (survives reloads via /hydrate). */
+  pendingForProject(projectId: string): { requestId: string; kind: "permission" | "question" } | null {
+    for (const [requestId, entry] of this.pendingInteractions) {
+      if (entry.pending.projectId === projectId) return { requestId, kind: entry.pending.kind };
+    }
+    return null;
+  }
+
+  /** Drop the in-memory session mapping (used when creating/switching chat sessions). */
+  resetSession(projectId: string): void {
+    const sid = this.sessionIdByProject.get(projectId);
+    if (sid) {
+      this.sessionIdByProject.delete(projectId);
+      this.projectIdBySession.delete(sid);
+    }
   }
 
   // ---- session registry ----
@@ -805,7 +825,15 @@ export function setSandboxBridge(b: { isE2B(projectId: string): boolean; getRela
 
 let runtime: ZCodeRuntime | null = null;
 export function initRuntime(deps: RuntimeDeps): ZCodeRuntime {
+  // bun --hot re-runs module init on file change — reuse the live runtime so the
+  // previous core process is not orphaned (each core is ~250MB resident).
+  const g = globalThis as unknown as { __zcodeRuntimeSingleton?: ZCodeRuntime };
+  if (g.__zcodeRuntimeSingleton) {
+    runtime = g.__zcodeRuntimeSingleton;
+    return runtime;
+  }
   runtime = new ZCodeRuntime(deps);
+  g.__zcodeRuntimeSingleton = runtime;
   return runtime;
 }
 export function getRuntime(): ZCodeRuntime {

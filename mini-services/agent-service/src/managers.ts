@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { db } from "./db";
-import { DESIGN_SYSTEMS_DIR, PACKS_DIR, projectWorkspaceDir } from "./config";
+import { CORE_EXTRACTED_DIR, DESIGN_SYSTEMS_DIR, PACKS_DIR, projectWorkspaceDir } from "./config";
 
 // ---------------- skills ----------------
 
@@ -32,17 +32,96 @@ function walkSkillDirs(root: string, depth = 0): { path: string; slug: string }[
   return out;
 }
 
+/**
+ * Builtin skills shipped with the platform — the skills inside the vendored
+ * core's plugins/packages (document, spreadsheets, pdf, presentations,
+ * browser-use, computer-use, ios/android, guide, …) plus the local packs.
+ */
+function builtinSkillDirs(): { path: string; slug: string; origin: string }[] {
+  const out: { path: string; slug: string; origin: string }[] = [];
+  const roots: { base: string; origin: string }[] = [
+    { base: path.join(CORE_EXTRACTED_DIR, "packages"), origin: "builtin" },
+    { base: path.join(CORE_EXTRACTED_DIR, "plugins"), origin: "builtin" },
+    { base: path.join(CORE_EXTRACTED_DIR, "skills"), origin: "builtin" },
+  ];
+  const seen = new Set<string>();
+  for (const { base, origin } of roots) {
+    for (const dir of walkSkillDirs(base)) {
+      if (seen.has(dir.slug)) continue;
+      seen.add(dir.slug);
+      out.push({ ...dir, origin });
+    }
+  }
+  return out;
+}
+
 export async function listSkills(projectId?: string) {
   const rows = await db.skillInstall.findMany({ orderBy: { createdAt: "asc" } });
-  const skills = rows.map((r) => ({
-    slug: r.slug,
-    name: r.name,
-    description: r.description,
-    source: r.source,
-    scope: r.scope,
-    enabled: r.enabled,
-  }));
-  // available packs (not yet installed)
+  const bySlug = new Map(rows.map((r) => [r.slug, r]));
+
+  interface SkillRow {
+    slug: string;
+    name: string;
+    description: string;
+    source: string;
+    scope: string;
+    enabled: boolean;
+  }
+  const skills: SkillRow[] = [];
+  const push = (s: SkillRow) => {
+    if (!skills.some((x) => x.slug === s.slug)) skills.push(s);
+  };
+
+  // 1. builtin skills from the core (installed rows override)
+  for (const dir of builtinSkillDirs()) {
+    try {
+      const fm = parseFrontmatter(fs.readFileSync(path.join(dir.path, "SKILL.md"), "utf8"));
+      const row = bySlug.get(dir.slug);
+      push({
+        slug: dir.slug,
+        name: row?.name || fm.name || dir.slug,
+        description: row?.description || (fm.description || "").slice(0, 160),
+        source: row?.source || dir.origin,
+        scope: row?.scope || "user",
+        enabled: row?.enabled ?? true,
+      });
+    } catch {
+      /* noop */
+    }
+  }
+  // 2. pack skills (superpowers / design) — listed even before installing
+  for (const pack of ["superpowers", "design"]) {
+    for (const dir of walkSkillDirs(path.join(PACKS_DIR, pack))) {
+      if (bySlug.has(dir.slug)) continue;
+      try {
+        const fm = parseFrontmatter(fs.readFileSync(path.join(dir.path, "SKILL.md"), "utf8"));
+        push({ slug: dir.slug, name: fm.name || dir.slug, description: (fm.description || "").slice(0, 160), source: pack, scope: "workspace", enabled: false });
+      } catch {
+        /* noop */
+      }
+    }
+  }
+  // 3. workspace-scoped custom skills on disk
+  if (projectId) {
+    const wsDir = projectWorkspaceDir(projectId);
+    for (const base of [".zcode/skills", ".agents/skills"]) {
+      for (const dir of walkSkillDirs(path.join(wsDir, base))) {
+        if (bySlug.has(dir.slug) || skills.some((s) => s.slug === dir.slug)) continue;
+        try {
+          const fm = parseFrontmatter(fs.readFileSync(path.join(dir.path, "SKILL.md"), "utf8"));
+          push({ slug: dir.slug, name: fm.name || dir.slug, description: (fm.description || "").slice(0, 160), source: "workspace", scope: "workspace", enabled: true });
+        } catch {
+          /* noop */
+        }
+      }
+    }
+  }
+  // 4. installed db rows that aren't on disk anymore (user installs, remote sources)
+  for (const r of rows) {
+    push({ slug: r.slug, name: r.name, description: r.description, source: r.source, scope: r.scope, enabled: r.enabled });
+  }
+
+  // available packs (not yet installed) — kept for the pack installer UI
   const packs: { slug: string; name: string; pack: string; description: string }[] = [];
   for (const pack of ["superpowers", "design"]) {
     for (const dir of walkSkillDirs(path.join(PACKS_DIR, pack))) {
@@ -56,24 +135,7 @@ export async function listSkills(projectId?: string) {
       }
     }
   }
-  // workspace-scoped custom skills on disk
-  const disk: { slug: string; name: string; description: string }[] = [];
-  if (projectId) {
-    const wsDir = projectWorkspaceDir(projectId);
-    for (const base of [".zcode/skills", ".agents/skills"]) {
-      for (const dir of walkSkillDirs(path.join(wsDir, base))) {
-        if (rows.some((r) => r.slug === dir.slug)) continue;
-        try {
-          const raw = fs.readFileSync(path.join(dir.path, "SKILL.md"), "utf8");
-          const fm = parseFrontmatter(raw);
-          disk.push({ slug: dir.slug, name: fm.name || dir.slug, description: (fm.description || "").slice(0, 160) });
-        } catch {
-          /* noop */
-        }
-      }
-    }
-  }
-  return { skills, packs, disk };
+  return { skills, packs, disk: [] as { slug: string; name: string; description: string }[] };
 }
 
 export async function installSkill(body: {
@@ -327,33 +389,38 @@ export async function mcpsForSession(names?: string[]): Promise<Record<string, u
 
 export async function listPlugins() {
   const rows = await db.pluginInstall.findMany();
-  const seedDir = path.join(process.cwd(), "..", "..", "agent-core", "extracted", "plugins");
   const plugins: Record<string, unknown>[] = [];
-  try {
-    for (const item of fs.readdirSync(seedDir, { withFileTypes: true })) {
-      if (!item.isDirectory()) continue;
-      const manifestPath = path.join(seedDir, item.name, ".zcode-plugin", "plugin.json");
-      if (fs.existsSync(manifestPath)) {
+  const seen = new Set<string>();
+  const scan = (seedDir: string, source: string) => {
+    try {
+      for (const item of fs.readdirSync(seedDir, { withFileTypes: true })) {
+        if (!item.isDirectory()) continue;
+        const manifestPath = path.join(seedDir, item.name, ".zcode-plugin", "plugin.json");
+        if (!fs.existsSync(manifestPath)) continue;
         try {
           const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
-          const skillsCount = countSkills(path.join(seedDir, item.name));
+          const slug = String(manifest.name || item.name);
+          if (seen.has(slug)) continue;
+          seen.add(slug);
           plugins.push({
-            slug: `${manifest.name || item.name}`,
+            slug,
             name: (manifest.name as string) || item.name,
             description: (manifest.description as string) || "",
             version: (manifest.version as string) || "",
-            enabled: rows.find((r) => r.slug === manifest.name)?.enabled ?? true,
-            source: "builtin",
-            skills: skillsCount,
+            enabled: rows.find((r) => r.slug === slug)?.enabled ?? true,
+            source,
+            skills: countSkills(path.join(seedDir, item.name)),
           });
         } catch {
           /* noop */
         }
       }
+    } catch {
+      /* noop */
     }
-  } catch {
-    /* noop */
-  }
+  };
+  scan(path.join(CORE_EXTRACTED_DIR, "plugins"), "builtin");
+  scan(path.join(CORE_EXTRACTED_DIR, "packages"), "builtin");
   return plugins;
 }
 

@@ -4,6 +4,7 @@ import type {
   AgentProfileDTO,
   ArtifactDTO,
   CheckpointDTO,
+  DesignSystemDTO,
   DevServerState,
   FileNode,
   GitLogEntry,
@@ -15,6 +16,7 @@ import type {
   PluginDTO,
   ProjectDTO,
   ProviderDTO,
+  SessionDTO,
   SkillDTO,
   SwarmRunDTO,
   UsageDTO,
@@ -78,12 +80,20 @@ export const updateProject = (id: string, body: Partial<ProjectDTO> & { modeConf
 export const deleteProject = (id: string) => bff<void>(`/projects/${id}`, { method: "DELETE" });
 
 // ---------- chat ----------
-export const hydrateProject = (id: string) => bff<HydratePayload>(`/projects/${id}/hydrate`);
+export const hydrateProject = (id: string, sessionId?: string) =>
+  bff<HydratePayload>(`/projects/${id}/hydrate${qs({ sessionId })}`);
 export const sendChat = (id: string, body: { content: string; modelSelection?: string; agentMode?: string }) =>
   bff<{ accepted: boolean }>(`/projects/${id}/chat`, { method: "POST", body: JSON.stringify(body) });
 export const stopChat = (id: string) => bff<{ stopped: boolean }>(`/projects/${id}/stop`, { method: "POST" });
 export const enhancePrompt = (prompt: string, mode: string): Promise<{ text: string }> =>
   bff("/enhance", { method: "POST", body: JSON.stringify({ prompt, mode }) });
+
+// ---------- chat sessions ("tasks" on one project) ----------
+export const listSessions = (id: string) => bff<{ sessions: SessionDTO[] }>(`/projects/${id}/sessions`);
+export const createSession = (id: string, title?: string) =>
+  bff<{ session: SessionDTO }>(`/projects/${id}/sessions`, { method: "POST", body: JSON.stringify({ title }) });
+export const activateSession = (id: string, sessionId: string) =>
+  bff<{ ok: boolean }>(`/projects/${id}/sessions/${sessionId}/activate`, { method: "POST" });
 
 // ---------- interactions ----------
 export const respondPermission = (body: {
@@ -126,6 +136,7 @@ export const gitCheckpoint = (id: string, label?: string) =>
 export const gitRestore = (id: string, checkpointId: string) =>
   bff<{ ok: boolean }>(`/projects/${id}/git/restore`, { method: "POST", body: JSON.stringify({ checkpointId }) });
 export const listCheckpoints = (id: string) => bff<{ checkpoints: CheckpointDTO[] }>(`/projects/${id}/checkpoints`);
+export const listVersions = (id: string) => bff<{ versions: CheckpointDTO[] }>(`/projects/${id}/versions`);
 
 // ---------- artifacts / export ----------
 export const listArtifacts = (id: string) => bff<{ artifacts: ArtifactDTO[] }>(`/projects/${id}/artifacts`);
@@ -137,8 +148,8 @@ export const artifactRawUrl = (id: string, path: string) => `/api/bff/projects/$
 export const devServerAction = (id: string, action: "start" | "stop" | "restart") =>
   bff<DevServerState>(`/projects/${id}/devserver`, { method: "POST", body: JSON.stringify({ action }) });
 export const getDevServer = (id: string) => bff<DevServerState>(`/projects/${id}/devserver`);
-export const previewUrl = (id: string, path = "") => `/api/bff/projects/${id}/preview/${path}`;
-export const previewBase = (id: string) => `/api/bff/projects/${id}/preview/`;
+export const previewUrl = (id: string, path = "") => `/preview/${id}${path}`;
+export const previewBase = (id: string) => `/preview/${id}/`;
 
 // ---------- sandbox ----------
 export const sandboxAction = (id: string, action: "start" | "stop" | "sync") =>

@@ -6,6 +6,8 @@ for pid in $(ss -tlnp 2>/dev/null | grep ":$PORT" | grep -oP 'pid=\K[0-9]+' | so
 done
 pkill -9 -f "bun --hot src/index.ts" 2>/dev/null
 pkill -9 -f "zcode.cjs app-server" 2>/dev/null
+pkill -9 -f "zcode-cli" 2>/dev/null          # core renames its process title
+pkill -9 -f "zcode-node-repl" 2>/dev/null    # core-spawned MCP children
 sleep 2
 if ss -tlnp 2>/dev/null | grep -q ":$PORT"; then
   echo "ERROR: port $PORT still in use"; exit 1
